@@ -1,19 +1,25 @@
+-- MapImportPlus -- standalone test mod for the upcoming UVTT/Foundry import
+-- improvements. Duplicates the Codex's MapImport.lua and the floor-processing
+-- part of CreateMapDialog.lua so the new behavior (asset picker dialog,
+-- secret-door handling, unrecognized-Foundry-walls checkbox) can be tested
+-- on a Steam-installed Codex without modifying its files.
+--
+-- When the future PR lands in the Codex itself, this mod can be removed or
+-- left alongside as a parallel entry point. Settings IDs intentionally match
+-- the PR so your saved choices migrate transparently.
+--
+-- Entry: a "Map Import+" dockable panel registers a button that opens the
+-- file-drop dialog and then the asset picker. Use scripts/fvtt_to_uvtt.py
+-- to produce .dd2vtt files first, then drag them into the panel.
+
 local mod = dmhub.GetModLoading()
 
--- Upper bound on per-axis tile count the import dialog will accept.
--- MapGridController.BuildMesh (C# engine) iterates O(width * height^2) on its
--- point-cull path, so a pathological manifest (one imported map in the wild
--- was 48358 x 19199) pegs a CPU core for hours before the map finishes
--- loading. MapGridController has its own 4M-cell bailout as a last resort;
--- this is the user-facing cap so the dialog refuses to ever produce one.
-local MAX_MAP_TILES_PER_AXIS = 2000
+----------------------------------------------------------------------------
+-- Settings (same IDs as the future PR; if both the Codex PR and this mod
+-- declare the setting, DMHub picks one declaration -- behavior is identical
+-- because defaults match).
+----------------------------------------------------------------------------
 
-local g_modalDialog = nil
-
--- Settings for the UVTT/Foundry import asset picker. Defaults match the
--- constants that were previously hardcoded in CreateMapDialog.lua so existing
--- import paths (and any caller of FinishMapImport that bypasses the picker)
--- continue to behave the same way.
 setting{
     id = "mapimport:wall_asset_id",
     description = "UVTT Import: Wall Material",
@@ -183,41 +189,27 @@ setting{
     storage = "preference",
 }
 
-local function ProgressPanel()
+----------------------------------------------------------------------------
+-- Namespace. DMHub's sandbox throws on reads of uninitialized globals, so
+-- the usual `X = X or {}` idiom is not safe here. Just assign.
+----------------------------------------------------------------------------
 
-	return gui.Panel{
-		flow = "vertical",
-		halign = "center",
-		valign = "center",
-		width = "100%",
-		height = 256,
+MapImportPlus = {}
 
-		gui.ProgressBar{
-			width = "80%",
-			height = 64,
-			value = 0,
-		},
+----------------------------------------------------------------------------
+-- Helpers copied from CreateMapDialog.lua
+----------------------------------------------------------------------------
 
-		gui.Label{
-			text = "Importing...",
-			width = "auto",
-			height = "auto",
-			fontSize = 16,
-			margin = 6,
-		},
-	}
-end
+local function isClockwise(polygon)
+    local sum = 0
+    local n = #polygon
 
-local function ErrorPanel(msg)
-    return gui.Label{
-        width = "auto",
-        height = "auto",
-        maxWidth = 500,
-        halign = "center",
-        valign = "center",
-        fontSize = 18,
-        text = msg,
-    }
+    for i = 1, n do
+        local j = (i % n) + 1
+        sum = sum + (polygon[j].x - polygon[i].x) * (polygon[j].y + polygon[i].y)
+    end
+
+    return sum > 0
 end
 
 local function ComponentTypeMatches(value, componentType)
@@ -266,1029 +258,1010 @@ local function ObjectNodeHasComponent(id, componentType)
     return false
 end
 
-mod.shared.ImportMapDialog = function(paths, options)
-    options = options or {}
+----------------------------------------------------------------------------
+-- ImportMapToFloorCo -- spawns walls, doors, secret doors, windows, lights
+-- onto a floor based on the UVTT data. Adapted from CreateMapDialog.lua
+-- with the asset-choices wiring and secret-door / unrecognized-walls
+-- handling added.
+----------------------------------------------------------------------------
 
-    local resultPanel
-    local importPanel
+MapImportPlus.ImportMapToFloorCo = function(info)
+    if info == nil or info.floor == nil or info.primaryFloor == nil then
+        return
+    end
 
-    local tileType = options.tileType or "squares"
+    local obj = info.floor:SpawnObjectLocal(info.objid)
+    if obj == nil then
+        return
+    end
 
-    -- 140 PPS auto-detection state.
-    local perfectFitChecked = false
-    local perfectFitActive = false
+    obj.x = 0
+    obj.y = 0
+    obj:Upload()
 
-    -- Forward-declare so the confirmButton closure (defined below) can capture them as upvalues.
-    -- Set later inside the floorImport branch when the user clicks "Match Existing Map".
-    local matchApplied = false
-    local capturedMatchCalibration = nil
+    if type(info.uvttData) ~= "table" then
+        return
+    end
 
-    local confirmButton = gui.Button{
-        classes = {"sizeL", "hidden"},
-        text = "Finish",
-        valign = "center",
-        halign = "center",
-        click = function()
-            resultPanel.children = {
-                ProgressPanel()
-            }
-            importPanel:Confirm(function(progress, info)
+    local function pointsEqual(a, b)
+        return a ~= nil and b ~= nil
+            and tonumber(a.x) == tonumber(b.x)
+            and tonumber(a.y) == tonumber(b.y)
+    end
 
-                if progress == nil then
-                    -- Capture values before closing the modal destroys the panel.
-                    local imgW = importPanel.imageWidth
-                    local imgH = importPanel.imageHeight
+    local function gridSize(data)
+        local result = 100
+        if type(data.grid) == "table" then
+            result = tonumber(data.grid.size) or 100
+        elseif data.grid ~= nil then
+            result = tonumber(data.grid) or 100
+        end
+        if result == 0 then
+            result = 100
+        end
+        return result
+    end
 
-                    printf("FLOOR_ALIGN_DIAG:: Confirm finish (Finish button). imgW=%s imgH=%s info.width=%s info.height=%s matchApplied=%s",
-                        tostring(imgW), tostring(imgH), tostring(info.width), tostring(info.height), tostring(matchApplied))
-                    printf("FLOOR_ALIGN_DIAG:: Confirm info=%s", json(info))
+    local function safeColor(value, defaultValue)
+        local text = tostring(value or defaultValue or "ffffff")
+        if string.sub(text, 1, 1) ~= "#" then
+            text = "#" .. text
+        end
 
-                    gui.CloseModal()
+        local ok, result = pcall(function() return core.Color(text) end)
+        if ok then
+            return result
+        end
 
-                    g_modalDialog = nil
+        return core.Color("#ffffff")
+    end
 
-                    if options.finish ~= nil then
-                        -- Attach the local file paths and image dimensions for the alignment dialog.
-                        info.paths = paths
-                        info.imageWidth = imgW
-                        info.imageHeight = imgH
-                        if matchApplied and capturedMatchCalibration ~= nil then
-                            info.matchCalibration = capturedMatchCalibration
-                            printf("FLOOR_ALIGN_DIAG:: Attached matchCalibration to info: %s", json(capturedMatchCalibration))
-                        end
-                        options.finish(info)
+    local function portalObjectScale(nodeId, segmentLength)
+        local node = nodeId and assets:GetObjectNode(nodeId)
+        local imageId = node and (node.image or node.thumbnailId or node.imageId)
+        local info = imageId and gui.TryGetImageDimensions(imageId)
+        local width = info and tonumber(info.width)
+        local height = info and tonumber(info.height)
+        local ppu = info and tonumber(info.ppu)
+
+        if width ~= nil and height ~= nil and ppu ~= nil and ppu > 0 then
+            -- Object instance scale is absolute for the image. The asset node's
+            -- default scale is already consumed by normal spawning behavior and
+            -- would make imported portals too small if applied again here.
+            local nativeLongAxisTiles = math.max(width, height) / ppu
+            if nativeLongAxisTiles > 0 then
+                return segmentLength / nativeLongAxisTiles
+            end
+        end
+
+        return segmentLength
+    end
+
+    local maxcount = 0
+    while (obj.area == nil or (obj.area.x1 == 0 and obj.area.x2 == 0)) and maxcount < 20 do
+        coroutine.yield(0.1)
+        maxcount = maxcount + 1
+    end
+
+    for i = 1, 60 do
+        coroutine.yield(0.01)
+    end
+
+    local area = obj.area
+    if area == nil then
+        return
+    end
+
+    local data = info.uvttData
+    local choices = info.assetChoices or {}
+    local function importAsset(choiceValue, settingId, fallback)
+        local value = choiceValue
+        if value == nil or value == "" then
+            value = dmhub.GetSettingValue(settingId)
+        end
+        if value == nil or value == "" then
+            value = fallback
+        end
+        return value
+    end
+
+    local wallAsset       = choices.wallAssetId        or dmhub.GetSettingValue("mapimport:wall_asset_id")
+    local objectWallAsset = choices.objectWallAssetId  or dmhub.GetSettingValue("mapimport:object_wall_asset_id")
+    local terrainWallAsset = importAsset(choices.terrainWallAssetId, "mapimport:terrain_wall_asset_id", objectWallAsset)
+    local invisibleWallAsset = importAsset(choices.invisibleWallAssetId, "mapimport:invisible_wall_asset_id", objectWallAsset)
+    local transparentWindowWallAsset = importAsset(choices.transparentWindowWallAssetId, "mapimport:transparent_window_wall_asset_id", objectWallAsset)
+    local unrecognizedWallAsset = choices.unrecognizedWallAssetId or dmhub.GetSettingValue("mapimport:unrecognized_wall_asset_id") or wallAsset
+    local doornode        = choices.doorObjectId       or dmhub.GetSettingValue("mapimport:door_object_id")
+    local windownode      = choices.windowObjectId     or dmhub.GetSettingValue("mapimport:window_object_id")
+    local secretDoorNode  = choices.secretDoorObjectId or dmhub.GetSettingValue("mapimport:secret_door_object_id")
+    local lightnode       = choices.lightObjectId      or dmhub.GetSettingValue("mapimport:light_object_id")
+    local function normalizeMode(value, defaultValue, allowed)
+        local mode = tostring(value or defaultValue)
+        if allowed[mode] == true then
+            return mode
+        end
+        return defaultValue
+    end
+
+    local function importMode(choiceKey, settingId, defaultValue, allowed)
+        local mode = choices[choiceKey]
+        if mode == nil then
+            mode = dmhub.GetSettingValue(settingId)
+        end
+        return normalizeMode(mode, defaultValue, allowed)
+    end
+
+    local function legacyImportMode(choiceKey, legacyChoiceKey, settingId, legacySettingId, defaultValue, allowed)
+        local mode = choices[choiceKey]
+        if mode == nil then
+            mode = choices[legacyChoiceKey]
+        end
+        if mode == nil then
+            mode = dmhub.GetSettingValue(settingId)
+        end
+        if mode == nil or mode == "" then
+            mode = dmhub.GetSettingValue(legacySettingId)
+        end
+        return normalizeMode(mode, defaultValue, allowed)
+    end
+
+    local function appendList(result, source)
+        if type(source) == "table" then
+            for _, item in ipairs(source) do
+                result[#result+1] = item
+            end
+        end
+    end
+
+    local function mergedFoundryInvisibleWalls(data)
+        local result = {}
+        appendList(result, type(data) == "table" and data.foundry_invisible_walls or nil)
+        appendList(result, type(data) == "table" and data.foundry_movement_walls or nil)
+        return result
+    end
+
+    local function hasEntries(list)
+        return type(list) == "table" and #list > 0
+    end
+
+    local function optionalList(list)
+        if hasEntries(list) then
+            return list
+        end
+        return nil
+    end
+
+    local wallModeAllowed = {wall = true, none = true}
+    local assetModeAllowed = {asset = true, none = true}
+    local windowModeAllowed = {asset = true, movement_wall = true, none = true}
+    local structuralWallMode = importMode("structuralWallMode", "mapimport:structural_wall_mode", "wall", wallModeAllowed)
+    local objectWallMode = importMode("objectWallMode", "mapimport:object_wall_mode", "wall", wallModeAllowed)
+    local terrainWallMode = importMode("terrainWallMode", "mapimport:terrain_wall_mode", "wall", wallModeAllowed)
+    local invisibleWallMode = legacyImportMode("invisibleWallMode", "movementWallMode", "mapimport:invisible_wall_mode", "mapimport:movement_wall_mode", "wall", wallModeAllowed)
+    local unrecognizedWallMode = importMode("unrecognizedWallMode", "mapimport:unrecognized_wall_mode", "none", wallModeAllowed)
+    local doorMode = importMode("doorMode", "mapimport:door_mode", "asset", assetModeAllowed)
+    local windowMode = importMode("windowMode", "mapimport:window_mode", "asset", windowModeAllowed)
+    local secretDoorMode = importMode("secretDoorMode", "mapimport:secret_door_mode", "asset", assetModeAllowed)
+    local lightMode = importMode("lightMode", "mapimport:light_mode", "asset", assetModeAllowed)
+    if choices.unrecognizedWallMode == nil and choices.includeUnrecognizedWalls ~= nil then
+        unrecognizedWallMode = cond(choices.includeUnrecognizedWalls == true, "wall", "none")
+    end
+    local flipFoundryTerrainWalls = choices.flipFoundryTerrainWalls == true
+    if choices.flipFoundryTerrainWalls == nil then
+        flipFoundryTerrainWalls = dmhub.GetSettingValue("mapimport:flip_foundry_terrain_walls") == true
+    end
+    local nudgeX = tonumber(choices.alignmentOffsetX) or 0
+    local nudgeY = tonumber(choices.alignmentOffsetY) or 0
+    if nudgeX ~= 0 or nudgeY ~= 0 then
+        area = {
+            x1 = area.x1 + nudgeX,
+            x2 = area.x2 + nudgeX,
+            y1 = area.y1 - nudgeY,
+            y2 = area.y2 - nudgeY,
+        }
+    end
+
+    local function executeWalls(points, wallid, closed)
+        if #points == 0 or wallid == nil or wallid == "" then
+            return
+        end
+
+        info.primaryFloor:ExecutePolygonOperation{
+            points = points,
+            tileid = nil,
+            wallid = wallid,
+            erase = false,
+            closed = closed,
+        }
+    end
+
+    local function appendWorldPoint(points, p)
+        if type(p) ~= "table" then
+            return false
+        end
+
+        local x = tonumber(p.x)
+        local y = tonumber(p.y)
+        if x == nil or y == nil then
+            return false
+        end
+
+        points[#points+1] = area.x1 + x
+        points[#points+1] = area.y2 - y
+        return true
+    end
+
+    local function copySegments(lineSet)
+        local segments = {}
+        if type(lineSet) ~= "table" then
+            return segments
+        end
+
+        for _, segment in ipairs(lineSet) do
+            if type(segment) == "table" and #segment >= 2 then
+                local copy = {}
+                for _, p in ipairs(segment) do
+                    if type(p) == "table" and tonumber(p.x) ~= nil and tonumber(p.y) ~= nil then
+                        copy[#copy+1] = {x = tonumber(p.x), y = tonumber(p.y)}
                     end
-                    return
+                end
+                if #copy >= 2 then
+                    segments[#segments+1] = copy
+                end
+            end
+        end
+
+        return segments
+    end
+
+    local function processLineSet(lineSet, wallid, objectWalls)
+        local segments = copySegments(lineSet)
+        local segmentsDeleted = {}
+        local changes = true
+        local ncount = 0
+
+        while (not objectWalls) and changes and ncount < 50 do
+            changes = false
+            ncount = ncount + 1
+
+            for i, segment in ipairs(segments) do
+                if segmentsDeleted[i] == nil then
+                    for j, nextSegment in ipairs(segments) do
+                        if i ~= j and segmentsDeleted[j] == nil and pointsEqual(segment[#segment], nextSegment[1]) then
+                            for _, point in ipairs(nextSegment) do
+                                segment[#segment+1] = point
+                            end
+
+                            segmentsDeleted[j] = true
+                            changes = true
+                        end
+                    end
+                end
+            end
+        end
+
+        local pointsList = {}
+        local objectPointsList = {}
+        for i, seg in ipairs(segments) do
+            if segmentsDeleted[i] == nil then
+                local poly = seg
+                if objectWalls and pointsEqual(seg[1], seg[#seg]) and not isClockwise(seg) then
+                    poly = {}
+                    for j = #seg, 1, -1 do
+                        poly[#poly+1] = seg[j]
+                    end
                 end
 
-                resultPanel:FireEventTree("progress", progress)
-            end)
-        end,
-    }
+                local isObject = objectWalls and pointsEqual(poly[1], poly[#poly])
+                local points = {}
+                for j, p in ipairs(poly) do
+                    if (not isObject) or j ~= #poly then
+                        appendWorldPoint(points, p)
+                    end
+                end
 
-
-    local continueButton = gui.Button{
-        classes = {"sizeL", "hidden"},
-        text = "Continue>>",
-        valign = "center",
-        halign = "center",
-        click = function()
-            importPanel:Next()
-        end,
-    }
-
-
-    local previousButton = gui.Button{
-        classes = {"sizeL", "hidden"},
-        text = "Back",
-        valign = "center",
-        halign = "left",
-        click = function()
-            importPanel:Previous()
-        end,
-    }
-
-
-    local buttonsPanel = gui.Panel{
-        valign = "bottom",
-        halign = "center",
-        width = "70%",
-        height = "auto",
-        flow = "none",
-        previousButton,
-        continueButton,
-        confirmButton,
-    }
-
-    local instructionsText = gui.Label{
-        width = 400,
-        height = "auto",
-        wrap = true,
-        textAlignment = "topleft",
-        fontSize = 18,
-        halign = "left",
-        valign = "top",
-    }
-
-    local gridlessChoice = gui.EnumeratedSliderControl{
-        options = {
-            {id = true, text = "Grid"},
-            {id = false, text = "Gridless"},
-        },
-
-        width = 400,
-
-        valign = "top",
-
-        value = true,
-
-        change = function(element)
-            if element.value == true then
-                importPanel:ClearMarkers()
-            else
-                importPanel:CreateGridless()
+                if #points >= 4 then
+                    if isObject then
+                        objectPointsList[#objectPointsList+1] = points
+                    else
+                        pointsList[#pointsList+1] = points
+                    end
+                end
             end
-        end,
+        end
 
-        vmargin = 16,
+        executeWalls(pointsList, wallid, false)
+        executeWalls(objectPointsList, wallid, true)
+    end
+
+    local function lineSetHasSegments(lineSet)
+        if type(lineSet) ~= "table" then
+            return false
+        end
+
+        for _, segment in ipairs(lineSet) do
+            if type(segment) == "table" and #segment >= 2 then
+                return true
+            end
+        end
+
+        return false
+    end
+
+    local function splitOpenClosedLineSet(lineSet)
+        local openLines = {}
+        local closedLines = {}
+        if type(lineSet) ~= "table" then
+            return openLines, closedLines
+        end
+
+        for _, segment in ipairs(lineSet) do
+            if type(segment) == "table" and #segment >= 2 then
+                if pointsEqual(segment[1], segment[#segment]) then
+                    closedLines[#closedLines+1] = segment
+                else
+                    openLines[#openLines+1] = segment
+                end
+            end
+        end
+
+        return openLines, closedLines
+    end
+
+    local function buildPolylines(walls)
+        local out = {}
+        if type(walls) ~= "table" then
+            return out
+        end
+
+        for _, wall in ipairs(walls) do
+            if type(wall) == "table" and type(wall.points) == "table" and #wall.points >= 2 then
+                local pts = {}
+                for _, p in ipairs(wall.points) do
+                    appendWorldPoint(pts, p)
+                end
+                if #pts >= 4 then
+                    out[#out+1] = pts
+                end
+            end
+        end
+
+        return out
+    end
+
+    local function reverseLine(line)
+        local result = {}
+        for i = #line, 1, -1 do
+            result[#result+1] = line[i]
+        end
+        return result
+    end
+
+    local function buildWallLineSet(walls)
+        local out = {}
+        if type(walls) ~= "table" then
+            return out
+        end
+
+        for _, wall in ipairs(walls) do
+            local sourcePoints = type(wall) == "table" and wall.points or nil
+            if type(sourcePoints) == "table" and #sourcePoints >= 2 then
+                local pts = {}
+                for _, p in ipairs(sourcePoints) do
+                    if type(p) == "table" and tonumber(p.x) ~= nil and tonumber(p.y) ~= nil then
+                        pts[#pts+1] = {x = tonumber(p.x), y = tonumber(p.y)}
+                    end
+                end
+                if #pts >= 2 then
+                    out[#out+1] = pts
+                end
+            end
+        end
+
+        return out
+    end
+
+    local function foundrySenseName(value)
+        value = tonumber(value)
+        if value == 0 then return "None" end
+        if value == 10 then return "Limited" end
+        if value == 20 then return "Normal" end
+        if value == 30 then return "Proximity" end
+        if value == 40 then return "Distance" end
+        return tostring(value)
+    end
+
+    local function foundryDoorName(value)
+        value = tonumber(value)
+        if value == 0 then return "Wall" end
+        if value == 1 then return "Door" end
+        if value == 2 then return "SecretDoor" end
+        return tostring(value)
+    end
+
+    local function foundryDirectionName(value)
+        value = tonumber(value)
+        if value == 0 then return "Both" end
+        if value == 1 then return "Left" end
+        if value == 2 then return "Right" end
+        return tostring(value)
+    end
+
+    local function foundryDoorStateName(value)
+        value = tonumber(value)
+        if value == 0 then return "Closed" end
+        if value == 1 then return "Open" end
+        if value == 2 then return "Locked" end
+        return tostring(value)
+    end
+
+    local function foundryWallFlags(wall)
+        local door = tonumber(wall.door) or 0
+        local sight = tonumber(wall.sight) or 20
+        local move = tonumber(wall.move) or 20
+        local light = tonumber(wall.light) or 20
+        local sound = tonumber(wall.sound) or 20
+        local dir = tonumber(wall.dir) or 0
+        local ds = tonumber(wall.ds) or 0
+        local threshold = type(wall.threshold) == "table" and wall.threshold or nil
+
+        local sense = {
+            door = door,
+            door_name = foundryDoorName(door),
+            sight = sight,
+            sight_name = foundrySenseName(sight),
+            move = move,
+            move_name = foundrySenseName(move),
+            light = light,
+            light_name = foundrySenseName(light),
+            sound = sound,
+            sound_name = foundrySenseName(sound),
+        }
+        if threshold ~= nil then
+            sense.threshold = threshold
+        end
+
+        return {
+            foundry_direction = dir,
+            foundry_direction_name = foundryDirectionName(dir),
+            foundry_door_state = ds,
+            foundry_door_state_name = foundryDoorStateName(ds),
+            foundry_sense = sense,
+        }
+    end
+
+    local function foundryWallEntry(p1, p2, wall)
+        local threshold = type(wall.threshold) == "table" and wall.threshold or nil
+        local entry = {
+            points = {p1, p2},
+            sense = {
+                door = foundryDoorName(tonumber(wall.door) or 0),
+                sight = foundrySenseName(tonumber(wall.sight) or 20),
+                move = foundrySenseName(tonumber(wall.move) or 20),
+                light = foundrySenseName(tonumber(wall.light) or 20),
+                sound = foundrySenseName(tonumber(wall.sound) or 20),
+            },
+            flags = foundryWallFlags(wall),
+        }
+        if threshold ~= nil then
+            entry.threshold = threshold
+        end
+        return entry
+    end
+
+    local function foundryPortal(p1, p2, wall, closed, secret)
+        local flags = foundryWallFlags(wall)
+        local portal = {
+            bounds = {p1, p2},
+            closed = closed,
+            flags = flags,
+            foundryDoorState = flags.foundry_door_state,
+            foundryDoorStateName = flags.foundry_door_state_name,
+            foundryDirection = flags.foundry_direction,
+            foundryDirectionName = flags.foundry_direction_name,
+        }
+        if secret == true then
+            portal.secret = true
+        end
+        return portal
+    end
+
+    local function processFoundryTerrainWalls(walls, wallid, flipOpen)
+        local segments = buildWallLineSet(walls)
+        local segmentsDeleted = {}
+        local changes = true
+        local ncount = 0
+
+        while changes and ncount < 50 do
+            changes = false
+            ncount = ncount + 1
+
+            for i, segment in ipairs(segments) do
+                if segmentsDeleted[i] == nil then
+                    for j, nextSegment in ipairs(segments) do
+                        if i ~= j and segmentsDeleted[j] == nil and pointsEqual(segment[#segment], nextSegment[1]) then
+                            for _, point in ipairs(nextSegment) do
+                                segment[#segment+1] = point
+                            end
+
+                            segmentsDeleted[j] = true
+                            changes = true
+                        end
+                    end
+                end
+            end
+        end
+
+        local pointsList = {}
+        local closedPointsList = {}
+        for i, seg in ipairs(segments) do
+            if segmentsDeleted[i] == nil then
+                local poly = seg
+                local closed = pointsEqual(poly[1], poly[#poly])
+                if closed and not isClockwise(poly) then
+                    poly = reverseLine(poly)
+                elseif (not closed) and flipOpen then
+                    poly = reverseLine(poly)
+                end
+
+                local points = {}
+                for j, p in ipairs(poly) do
+                    if (not closed) or j ~= #poly then
+                        appendWorldPoint(points, p)
+                    end
+                end
+
+                if #points >= 4 then
+                    if closed then
+                        closedPointsList[#closedPointsList+1] = points
+                    else
+                        pointsList[#pointsList+1] = points
+                    end
+                end
+            end
+        end
+
+        executeWalls(pointsList, wallid, false)
+        executeWalls(closedPointsList, wallid, true)
+    end
+
+    local function readPortalSegment(portal)
+        local bounds = type(portal) == "table" and portal.bounds or nil
+        if type(bounds) ~= "table" or #bounds ~= 2 then
+            return nil
+        end
+
+        local b1 = type(bounds[1]) == "table" and bounds[1] or nil
+        local b2 = type(bounds[2]) == "table" and bounds[2] or nil
+        local x1 = b1 and tonumber(b1.x) or nil
+        local y1 = b1 and tonumber(b1.y) or nil
+        local x2 = b2 and tonumber(b2.x) or nil
+        local y2 = b2 and tonumber(b2.y) or nil
+
+        if x1 == nil or y1 == nil or x2 == nil or y2 == nil then
+            return nil
+        end
+
+        local dx = x2 - x1
+        local dy = y2 - y1
+        return {
+            portal = portal,
+            x1 = x1,
+            y1 = y1,
+            x2 = x2,
+            y2 = y2,
+            closed = portal.closed == true,
+            secret = portal.secret == true,
+            length = math.sqrt(dx*dx + dy*dy),
+        }
+    end
+
+    local function endpointsEqual(ax, ay, bx, by)
+        return math.abs(ax - bx) <= 0.0001 and math.abs(ay - by) <= 0.0001
+    end
+
+    local function portalSegmentsTouch(a, b)
+        return endpointsEqual(a.x1, a.y1, b.x1, b.y1)
+            or endpointsEqual(a.x1, a.y1, b.x2, b.y2)
+            or endpointsEqual(a.x2, a.y2, b.x1, b.y1)
+            or endpointsEqual(a.x2, a.y2, b.x2, b.y2)
+    end
+
+    local function collapsedPortalFromGroup(group)
+        local minX = group[1].x1
+        local maxX = group[1].x1
+        local minY = group[1].y1
+        local maxY = group[1].y1
+        local best = group[1]
+        local closed = false
+        local secret = false
+
+        for _, segment in ipairs(group) do
+            minX = math.min(minX, segment.x1, segment.x2)
+            maxX = math.max(maxX, segment.x1, segment.x2)
+            minY = math.min(minY, segment.y1, segment.y2)
+            maxY = math.max(maxY, segment.y1, segment.y2)
+            closed = closed or segment.closed
+            secret = secret or segment.secret
+            if segment.length > best.length then
+                best = segment
+            end
+        end
+
+        local centerX = (minX + maxX) / 2
+        local centerY = (minY + maxY) / 2
+        local width = maxX - minX
+        local height = maxY - minY
+        local p1, p2
+
+        if width >= height then
+            if best.x1 <= best.x2 then
+                p1 = {x = minX, y = centerY}
+                p2 = {x = maxX, y = centerY}
+            else
+                p1 = {x = maxX, y = centerY}
+                p2 = {x = minX, y = centerY}
+            end
+        else
+            if best.y1 <= best.y2 then
+                p1 = {x = centerX, y = minY}
+                p2 = {x = centerX, y = maxY}
+            else
+                p1 = {x = centerX, y = maxY}
+                p2 = {x = centerX, y = minY}
+            end
+        end
+
+        return {
+            bounds = {p1, p2},
+            closed = closed,
+            secret = secret,
+        }
+    end
+
+    local function collapseConnectedPortals(portalList)
+        local segments = {}
+        if type(portalList) ~= "table" then
+            return segments
+        end
+
+        for _, portal in ipairs(portalList) do
+            local segment = readPortalSegment(portal)
+            if segment ~= nil then
+                segments[#segments+1] = segment
+            end
+        end
+
+        local result = {}
+        local used = {}
+        for i, segment in ipairs(segments) do
+            if used[i] == nil then
+                local group = {segment}
+                used[i] = true
+
+                local changed = true
+                while changed do
+                    changed = false
+                    for j, candidate in ipairs(segments) do
+                        if used[j] == nil and candidate.closed == segment.closed and candidate.secret == segment.secret then
+                            for _, member in ipairs(group) do
+                                if portalSegmentsTouch(member, candidate) then
+                                    group[#group+1] = candidate
+                                    used[j] = true
+                                    changed = true
+                                    break
+                                end
+                            end
+                        end
+                    end
+                end
+
+                if #group >= 3 then
+                    result[#result+1] = collapsedPortalFromGroup(group)
+                else
+                    for _, candidate in ipairs(group) do
+                        result[#result+1] = candidate.portal
+                    end
+                end
+            end
+        end
+
+        return result
+    end
+
+    local structuralLines = data.line_of_sight
+    local objectLines = data.objects_line_of_sight
+    local portals = type(data.portals) == "table" and data.portals or nil
+    local foundryTerrainWalls = type(data.foundry_terrain_walls) == "table" and data.foundry_terrain_walls or nil
+    local foundryInvisibleWalls = optionalList(mergedFoundryInvisibleWalls(data))
+    local foundryUnrecognizedWalls = type(data.foundry_unrecognized_walls) == "table" and data.foundry_unrecognized_walls or nil
+    local convertedFromFoundry = false
+    local objectOnlyLineOfSight = false
+
+    if type(structuralLines) ~= "table" and type(data.walls) == "table" then
+        convertedFromFoundry = true
+        structuralLines = {}
+        portals = {}
+        foundryTerrainWalls = {}
+        foundryInvisibleWalls = {}
+        foundryUnrecognizedWalls = {}
+
+        local foundryGrid = gridSize(data)
+        for _, wall in ipairs(data.walls) do
+            local points = type(wall) == "table" and wall.c or nil
+            if type(points) == "table" and #points == 4 then
+                local x1 = tonumber(points[1])
+                local y1 = tonumber(points[2])
+                local x2 = tonumber(points[3])
+                local y2 = tonumber(points[4])
+                if x1 ~= nil and y1 ~= nil and x2 ~= nil and y2 ~= nil then
+                    local p1 = {x = x1 / foundryGrid, y = y1 / foundryGrid}
+                    local p2 = {x = x2 / foundryGrid, y = y2 / foundryGrid}
+                    local door = tonumber(wall.door) or 0
+                    local move = tonumber(wall.move) or 20
+                    local sight = tonumber(wall.sight) or 20
+                    local light = tonumber(wall.light) or 20
+                    local dir = tonumber(wall.dir) or 0
+                    local threshold = type(wall.threshold) == "table" and wall.threshold or nil
+                    local windowLike = threshold ~= nil
+                        and threshold.light ~= nil and threshold.sight ~= nil
+                        and light ~= move and sight ~= move
+
+                    if (door == 0 or door == 2) and windowLike then
+                        portals[#portals+1] = foundryPortal(p1, p2, wall, false, false)
+                    elseif door == 1 then
+                        portals[#portals+1] = foundryPortal(p1, p2, wall, true, false)
+                    elseif door == 2 then
+                        portals[#portals+1] = foundryPortal(p1, p2, wall, true, true)
+                    elseif door ~= 0 or dir ~= 0 then
+                        foundryUnrecognizedWalls[#foundryUnrecognizedWalls+1] = foundryWallEntry(p1, p2, wall)
+                    elseif door == 0 and sight == 20 and move == 20 then
+                        structuralLines[#structuralLines+1] = {p1, p2}
+                    elseif door == 0 and sight == 10 and move == 20 then
+                        foundryTerrainWalls[#foundryTerrainWalls+1] = foundryWallEntry(p1, p2, wall)
+                    elseif door == 0 and sight == 0 and move == 20 then
+                        foundryInvisibleWalls[#foundryInvisibleWalls+1] = foundryWallEntry(p1, p2, wall)
+                    else
+                        foundryUnrecognizedWalls[#foundryUnrecognizedWalls+1] = foundryWallEntry(p1, p2, wall)
+                    end
+                end
+            end
+        end
+    end
+
+    if (not convertedFromFoundry)
+            and (not lineSetHasSegments(structuralLines))
+            and lineSetHasSegments(objectLines) then
+        objectOnlyLineOfSight = true
+        structuralLines, objectLines = splitOpenClosedLineSet(objectLines)
+    end
+
+    if structuralWallMode == "wall" then
+        processLineSet(structuralLines, wallAsset, false)
+    end
+    if objectWallMode == "wall" then
+        processLineSet(objectLines, objectWallAsset, true)
+    end
+    if terrainWallMode == "wall" then
+        processFoundryTerrainWalls(foundryTerrainWalls, terrainWallAsset, flipFoundryTerrainWalls)
+    end
+    if invisibleWallMode == "wall" then
+        processFoundryTerrainWalls(foundryInvisibleWalls, invisibleWallAsset, flipFoundryTerrainWalls)
+    end
+    if unrecognizedWallMode == "wall" then
+        executeWalls(buildPolylines(foundryUnrecognizedWalls), unrecognizedWallAsset, false)
+    end
+
+    if portals ~= nil then
+        local portalsToSpawn = portals
+        if objectOnlyLineOfSight then
+            portalsToSpawn = collapseConnectedPortals(portals)
+        end
+        for _, portal in ipairs(portalsToSpawn) do
+            local bounds = type(portal) == "table" and portal.bounds or nil
+            if type(bounds) == "table" and #bounds == 2 then
+                local b1 = type(bounds[1]) == "table" and bounds[1] or nil
+                local b2 = type(bounds[2]) == "table" and bounds[2] or nil
+                local x1 = b1 and tonumber(b1.x) or nil
+                local y1 = b1 and tonumber(b1.y) or nil
+                local x2 = b2 and tonumber(b2.x) or nil
+                local y2 = b2 and tonumber(b2.y) or nil
+
+                if x1 ~= nil and y1 ~= nil and x2 ~= nil and y2 ~= nil then
+                    local points = {area.x1 + x1, area.y2 - y1, area.x1 + x2, area.y2 - y2}
+                    local portalKind = "window"
+                    if portal.closed then
+                        portalKind = cond(portal.secret == true, "secret", "door")
+                    end
+                    local portalMode = windowMode
+                    if portalKind == "door" then
+                        portalMode = doorMode
+                    elseif portalKind == "secret" then
+                        portalMode = secretDoorMode
+                    end
+
+                    if portalMode == "asset" and not convertedFromFoundry and not objectOnlyLineOfSight then
+                        executeWalls({points}, wallAsset, false)
+                    elseif portalKind == "window" and portalMode == "movement_wall" then
+                        executeWalls({points}, transparentWindowWallAsset, false)
+                    end
+
+                    local nodeId = windownode
+                    if portal.closed then
+                        nodeId = cond(portal.secret == true, secretDoorNode, doornode)
+                    end
+
+                    if portalMode == "asset" and nodeId ~= nil and nodeId ~= "" then
+                        local portalObj = info.primaryFloor:SpawnObjectLocal(nodeId)
+                        if portalObj ~= nil then
+                            local flags = type(portal.flags) == "table" and portal.flags or nil
+                            local foundryDoorState = portal.foundryDoorState or (flags and flags.foundry_door_state)
+                            -- TODO: Apply Foundry open/locked door state when DMHub exposes a door-state API.
+                            local delta = core.Vector2(x2 - x1, y1 - y2)
+                            portalObj.x = area.x1 + ((x1 + x2) / 2)
+                            portalObj.y = area.y2 - ((y1 + y2) / 2)
+                            portalObj.rotation = delta.angle + (tonumber(dmhub.GetSettingValue("mapimport:portal_rotation_offset")) or 90)
+                            portalObj.scale = portalObjectScale(nodeId, delta.length)
+                            portalObj:Upload()
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if lightMode == "asset" and type(data.lights) == "table" and ObjectNodeHasComponent(lightnode, "Light") then
+        local foundryGrid = gridSize(data)
+        for _, light in ipairs(data.lights) do
+            if type(light) == "table" then
+                local x, y, radius, intensity, color, shadows
+                if type(light.position) == "table" then
+                    x = tonumber(light.position.x)
+                    y = tonumber(light.position.y)
+                    radius = tonumber(light.range) or 0
+                    intensity = ((tonumber(light.intensity) or 1) * 0.5) ^ 0.5
+                    color = safeColor(light.color, "ffffff")
+                    shadows = light.shadows
+                    if shadows == nil then
+                        shadows = true
+                    end
+                else
+                    x = tonumber(light.x) and (tonumber(light.x) / foundryGrid) or nil
+                    y = tonumber(light.y) and (tonumber(light.y) / foundryGrid) or nil
+                    radius = tonumber(light.dim) or tonumber(light.bright) or 0
+                    intensity = (tonumber(light.tintAlpha) or 0.1) * 3
+                    color = safeColor(light.tintColor, "#ffffff")
+                    shadows = true
+                end
+
+                if x ~= nil and y ~= nil then
+                    local lightObj = info.primaryFloor:SpawnObjectLocal(lightnode)
+                    local component = lightObj and lightObj:GetComponent("Light")
+                    if component ~= nil then
+                        lightObj.x = area.x1 + x
+                        lightObj.y = area.y2 - y
+                        component:SetProperty("radius", radius)
+                        component:SetProperty("intensity", intensity)
+                        component:SetProperty("castsShadows", shadows)
+                        component:SetProperty("color", color)
+                        lightObj:Upload()
+                    end
+                end
+            end
+        end
+    end
+
+    if type(data.environment) == "table" then
+        if data.environment.ambient_light ~= nil then
+            dmhub.SetSettingValue("undergroundillumination", safeColor(data.environment.ambient_light, "ffffff").value)
+        else
+            dmhub.SetSettingValue("undergroundillumination", 1.0)
+        end
+    end
+end
+
+----------------------------------------------------------------------------
+-- FinishMapImport -- creates the map, switches to it, and dispatches the
+-- floor processing through MapImportPlus.ImportMapToFloorCo (not the
+-- Codex's mod.shared.ImportMapToFloorCo, which lives in a different mod
+-- and is not reachable from here).
+----------------------------------------------------------------------------
+
+MapImportPlus.FinishMapImport = function(mapName, info)
+    local floors = {}
+
+    for i, objid in ipairs(info.objids) do
+        floors[#floors+1] = {
+            description = cond(#info.objids == 1, "Main Floor", string.format("Floor %d", i)),
+            layerDescription = "Map Layer",
+            parentFloor = #floors+1,
+        }
+
+        floors[#floors+1] = {
+            description = cond(#info.objids == 1, "Main Floor", string.format("Floor %d", i)),
+        }
+    end
+
+
+    local guid = game.CreateMap{
+        description = mapName,
+        groundLevel = #floors,
+        floors = floors,
     }
+    dmhub.Coroutine(function()
+        while game.GetMap(guid) == nil do
+            coroutine.yield(0.05)
+        end
 
-    -- "Match Existing Map" panel for floor imports.
-    local matchMapPanel = nil
+        local w = math.floor(info.width + 0.5)
+        local h = math.floor(info.height + 0.5)
 
-    if options.floorImport then
-        local dim = game.currentMap.dimensions
-        local mapW = dim.x2 - dim.x1
-        local mapH = dim.y2 - dim.y1
+        local MAX_DIM = 2000
+        if w > MAX_DIM or h > MAX_DIM then
+            w = math.min(w, MAX_DIM)
+            h = math.min(h, MAX_DIM)
+        end
 
-        printf("FLOOR_ALIGN_DIAG:: ImportMapDialog opened with floorImport=true. Existing currentMap.dimensions: x1=%s y1=%s x2=%s y2=%s -> mapW=%d mapH=%d",
-            json(dim.x1), json(dim.y1), json(dim.x2), json(dim.y2), mapW, mapH)
+        local map = game.GetMap(guid)
+        map.description = mapName
+        map.dimensions = {
+            x1 = -math.ceil(w / 2) + 1,
+            y1 = -math.ceil(h / 2) + 1,
+            x2 = math.floor(w / 2),
+            y2 = math.floor(h / 2),
+        }
+        map:Upload()
 
-        -- Try to find the existing primary map LevelObject so we can compare calibration later.
-        local existingMapObj = nil
-        for _, floor in ipairs(game.currentMap.floors) do
-            for _, obj in pairs(floor.objects) do
-                if obj:GetComponent("Map") ~= nil then
-                    existingMapObj = obj
+        map:Travel()
+
+        while game.currentMapId ~= guid do
+            coroutine.yield(0.05)
+        end
+
+        --try to wait a bit to make sure we are synced on the new map.
+        for i = 1, 120 do
+            coroutine.yield(0.01)
+        end
+
+        local settings = info.mapSettings
+        if settings ~= nil then
+            for k, v in pairs(settings) do
+                dmhub.SetSettingValue(k, v)
+            end
+        end
+
+        local mapFloors = game.currentMap.floorsWithoutLayers
+
+        for i, floor in ipairs(mapFloors) do
+            local uvttData = nil
+            if info.uvttData ~= nil then
+                uvttData = info.uvttData[i]
+            end
+
+            --send to the map layer instead of the primary floor.
+            local targetFloor = floor
+            for _, layer in ipairs(game.currentMap.floors) do
+                if layer.parentFloor == floor.floorid then
+                    targetFloor = layer
                     break
                 end
             end
-            if existingMapObj ~= nil then break end
-        end
-        if existingMapObj ~= nil then
-            local d = existingMapObj.mapAlignmentDiagnostic
-            if d ~= nil then
-                printf("FLOOR_ALIGN_DIAG:: Existing map LevelObject calibration: %s", json(d))
-            else
-                printf("FLOOR_ALIGN_DIAG:: existingMapObj had no mapAlignmentDiagnostic (component not yet calculated?)")
-            end
-        else
-            printf("FLOOR_ALIGN_DIAG:: No existing map LevelObject with a Map component found on currentMap.")
-        end
 
-        if mapW > 0 and mapH > 0 then
-            local matchInfoLabel = gui.Label{
-                width = 380,
-                height = "auto",
-                fontSize = 14,
-                text = "",
-                wrap = true,
-            }
-
-            matchMapPanel = gui.Panel{
-                classes = {"hidden"},
-                flow = "vertical",
-                width = 400,
-                height = "auto",
-                vmargin = 8,
-
-                updateMatchInfo = function(element, imgW, imgH)
-                    local tileW = imgW / mapW
-                    local tileH = imgH / mapH
-                    local ratio = math.abs(tileW - tileH) / math.max(tileW, tileH)
-                    printf("FLOOR_ALIGN_DIAG:: updateMatchInfo: imgW=%s imgH=%s mapW=%d mapH=%d -> tileW=%.4f tileH=%.4f ratio=%.4f",
-                        tostring(imgW), tostring(imgH), mapW, mapH, tileW, tileH, ratio)
-                    if ratio < 0.02 then
-                        matchInfoLabel.text = string.format("Image dimensions match the existing map. Tile size would be %.0f x %.0f px.", tileW, tileH)
-                    else
-                        matchInfoLabel.text = string.format("Tile size would be %.1f x %.1f px (non-square tiles).", tileW, tileH)
-                    end
-                end,
-
-                gui.Label{
-                    width = 400,
-                    height = "auto",
-                    fontSize = 14,
-                    wrap = true,
-                    text = string.format("The existing map is %dx%d tiles.", mapW, mapH),
-                },
-
-                matchInfoLabel,
-
-                gui.Button{
-                    classes = {"sizeL"},
-                    text = "Match Existing Map",
-                    halign = "left",
-                    vmargin = 4,
-                    click = function(element)
-                        printf("FLOOR_ALIGN_DIAG:: 'Match Existing Map' clicked. Calling CreateGridless + SetMapDimensions(%d, %d). imgW=%s imgH=%s",
-                            mapW, mapH, tostring(importPanel.imageWidth), tostring(importPanel.imageHeight))
-
-                        -- Capture the existing Map LevelObject's calibration so the
-                        -- new floor can copy controlPoints/scaling/mapType verbatim.
-                        -- This makes the new image render with identical _tileDim and
-                        -- _mapPivot, so it occupies the same world bounds as the existing
-                        -- when placed at the same (obj.x, obj.y).
-                        capturedMatchCalibration = nil
-                        for _, floor in ipairs(game.currentMap.floors) do
-                            for _, obj in pairs(floor.objects) do
-                                if obj:GetComponent("Map") ~= nil then
-                                    local d = obj.mapAlignmentDiagnostic
-                                    if d ~= nil then
-                                        local cps = {}
-                                        local cpCount = d.controlPointCount or 0
-                                        if d.controlPoints ~= nil then
-                                            for i = 1, cpCount do
-                                                local p = d.controlPoints[i]
-                                                if p ~= nil then
-                                                    cps[#cps+1] = {x = p.x, y = p.y}
-                                                end
-                                            end
-                                        end
-                                        capturedMatchCalibration = {
-                                            controlPoints = cps,
-                                            scaling = d.scaling or 1,
-                                            mapType = d.mapType or "squares",
-                                            x = d.x or 0,
-                                            y = d.y or 0,
-                                            sourceFloorid = d.floorid,
-                                            sourceObjid = d.objid,
-                                            sourceTileDimX = d.tileDimX,
-                                            sourceTileDimY = d.tileDimY,
-                                        }
-                                        printf("FLOOR_ALIGN_DIAG:: Captured match calibration from %s/%s: cps=%d, scaling=%d, mapType=%s, x=%.4f, y=%.4f",
-                                            d.floorid, d.objid, #cps, d.scaling or 1, tostring(d.mapType), d.x or 0, d.y or 0)
-                                        break
-                                    end
-                                end
-                            end
-                            if capturedMatchCalibration ~= nil then break end
-                        end
-                        if capturedMatchCalibration == nil then
-                            printf("FLOOR_ALIGN_DIAG:: WARNING: Match Existing Map clicked but no existing Map LevelObject found to capture from.")
-                        end
-
-                        importPanel:CreateGridless()
-                        gridlessChoice.value = false
-                        importPanel:SetMapDimensions(mapW, mapH)
-                        matchApplied = true
-                    end,
-                },
+            MapImportPlus.ImportMapToFloorCo{
+                objid = info.objids[i],
+                floor = targetFloor,
+                primaryFloor = floor,
+                uvttData = uvttData,
+                assetChoices = info.assetChoices,
             }
         end
-    end
 
-    local instructionsPanel = gui.Panel{
-        width = 400,
-        height = "auto",
-        flow = "vertical",
-        halign = "left",
-        valign = "top",
-        instructionsText,
-        gridlessChoice,
-        matchMapPanel,
-    }
-
-    -- "A Perfect Fit!" panel for 140 PPS auto-detection.
-    local perfectFitPanel
-    perfectFitPanel = gui.Panel{
-        classes = {"hidden"},
-        flow = "vertical",
-        width = 400,
-        height = "auto",
-        halign = "left",
-        valign = "top",
-
-        gui.Label{
-            width = 400,
-            height = "auto",
-            fontSize = 28,
-            bold = true,
-            color = "@success",
-            text = "A Perfect Fit!",
-            vmargin = 4,
-        },
-
-        gui.Label{
-            id = "perfectFitDescription",
-            width = 380,
-            height = "auto",
-            fontSize = 16,
-            wrap = true,
-            text = "",
-            vmargin = 8,
-        },
-
-        gui.Label{
-            id = "perfectFitDimensions",
-            width = 380,
-            height = "auto",
-            fontSize = 20,
-            text = "",
-            vmargin = 4,
-        },
-
-        gui.Panel{
-            width = 1,
-            height = 24,
-        },
-
-        gui.Button{
-            classes = {"sizeL"},
-            id = "perfectFitAccept",
-            text = "Accept",
-            halign = "left",
-            click = function(element)
-                -- Trigger the same confirm flow as the Finish button.
-                resultPanel.children = {
-                    ProgressPanel()
-                }
-                importPanel:Confirm(function(progress, info)
-                    if progress == nil then
-                        local imgW = importPanel.imageWidth
-                        local imgH = importPanel.imageHeight
-                        gui.CloseModal()
-                        g_modalDialog = nil
-                        if options.finish ~= nil then
-                            info.paths = paths
-                            info.imageWidth = imgW
-                            info.imageHeight = imgH
-                            options.finish(info)
-                        end
-                        return
-                    end
-                    resultPanel:FireEventTree("progress", progress)
-                end)
-            end,
-        },
-
-        gui.Button{
-            classes = {"sizeL"},
-            text = "Customize Grid...",
-            halign = "left",
-            vmargin = 8,
-            click = function(element)
-                perfectFitActive = false
-                perfectFitPanel:SetClass("hidden", true)
-                instructionsPanel:SetClass("hidden", false)
-                importPanel:ClearMarkers()
-                gridlessChoice.value = true
-            end,
-        },
-    }
-
-    local statusWidth = gui.Input{
-        fontSize = 16,
-        width = 80,
-        height = 24,
-        change = function(element)
-            local val = tonumber(element.text)
-            if val ~= nil and val >= 8 and val <= 4096 then
-                importPanel:SetWidth(val)
-            end
-        end,
-    }
-    local statusHeight = gui.Input{
-        fontSize = 16,
-        width = 80,
-        height = 24,
-        change = function(element)
-            local val = tonumber(element.text)
-            if val ~= nil and val >= 8 and val <= 4096 then
-                importPanel:SetHeight(val)
-            end
-        end,
-    }
-
-    -- Try to parse map dimensions from filename (e.g. "dungeon_20x18.png").
-    local inferredMapW, inferredMapH = nil, nil
-    if paths and #paths > 0 then
-        local filename = paths[1]
-        -- Strip directory separators to get just the filename.
-        filename = string.match(filename, "[^/\\]+$") or filename
-        -- Look for NxM pattern (digits x digits).
-        local w, h = string.match(filename, "(%d+)x(%d+)")
-        if w and h then
-            w, h = tonumber(w), tonumber(h)
-            if w >= 1 and w <= 500 and h >= 1 and h <= 500 then
-                inferredMapW, inferredMapH = w, h
-            end
-        end
-    end
-
-    -- Track whether we're showing tile dimensions or map dimensions mode.
-    local dimMode = "tile" -- "tile" or "map"
-
-    -- Track which map dimension fields the user has manually edited.
-    local mapWidthTouched = false
-    local mapHeightTouched = false
-
-    local tileDimPanel
-    local mapDimPanel
-
-    tileDimPanel = gui.Panel{
-        flow = "vertical",
-        width = "auto",
-        height = "auto",
-
-        gui.Panel{
-            flow = "horizontal",
-            width = "auto",
-            height = "auto",
-            gui.Label{
-                classes = {"sizeL"},
-                width = 90,
-                height = "auto",
-                text = "Width:",
-            },
-            statusWidth,
-            gui.Label{
-                classes = {"sizeL"},
-                lmargin = 4,
-                width = "auto",
-                height = "auto",
-                text = "px",
-            },
-        },
-
-        gui.Button{
-            classes = {"sizeM"},
-            vmargin = 8,
-            icon = "icons/icon_tool/icon_tool_30_unlocked.png",
-
-            data = {
-                unlocked = true,
-            },
-
-            press = function(element)
-                element.data.unlocked = not element.data.unlocked
-                importPanel.lockDimensions = not element.data.unlocked
-                element.bgimage = cond(element.data.unlocked, "icons/icon_tool/icon_tool_30_unlocked.png", "icons/icon_tool/icon_tool_30.png")
-            end,
-        },
-
-        gui.Panel{
-            flow = "horizontal",
-            width = "auto",
-            height = "auto",
-            gui.Label{
-                classes = {"sizeL"},
-                width = 90,
-                height = "auto",
-                text = "Height:",
-            },
-            statusHeight,
-            gui.Label{
-                classes = {"sizeL"},
-                lmargin = 4,
-                width = "auto",
-                height = "auto",
-                text = "px",
-            },
-        },
-    }
-
-    -- Get image dimensions using simple float properties (more robust than vec2).
-    local function getImageDim()
-        local w = importPanel.imageWidth
-        local h = importPanel.imageHeight
-        if w ~= nil and h ~= nil and w > 0 and h > 0 then
-            return w, h
-        end
-        return nil, nil
-    end
-
-    local mapDimInfoLabel
-    local mapDimWidth
-    local mapDimHeight
-
-    -- Shared handler: called when either map dimension field is edited.
-    -- `source` is "width" or "height", `val` is the parsed integer from that field.
-    local function onMapDimEdit(source, val)
-        if val == nil or val < 1 or val ~= math.floor(val) then
-            return
-        end
-
-        -- Cap per-axis tile count. See MAX_MAP_TILES_PER_AXIS above for why.
-        if val > MAX_MAP_TILES_PER_AXIS then
-            val = MAX_MAP_TILES_PER_AXIS
-            if source == "width" then
-                mapDimWidth.textNoNotify = tostring(val)
-            else
-                mapDimHeight.textNoNotify = tostring(val)
-            end
-        end
-
-        local imgW, imgH = getImageDim()
-        if imgW == nil then
-            return
-        end
-
-        if source == "width" then
-            mapWidthTouched = true
-            if not mapHeightTouched then
-                local inferredH = math.floor(val * (imgH / imgW) + 0.5)
-                if inferredH < 1 then inferredH = 1 end
-                if inferredH > MAX_MAP_TILES_PER_AXIS then inferredH = MAX_MAP_TILES_PER_AXIS end
-                mapDimHeight.textNoNotify = tostring(inferredH)
-                importPanel:SetMapDimensions(val, inferredH)
-            else
-                local hVal = tonumber(mapDimHeight.text)
-                if hVal ~= nil and hVal >= 1 and hVal == math.floor(hVal) then
-                    if hVal > MAX_MAP_TILES_PER_AXIS then
-                        hVal = MAX_MAP_TILES_PER_AXIS
-                        mapDimHeight.textNoNotify = tostring(hVal)
-                    end
-                    importPanel:SetMapDimensions(val, hVal)
-                end
-            end
-        else
-            mapHeightTouched = true
-            if not mapWidthTouched then
-                local inferredW = math.floor(val * (imgW / imgH) + 0.5)
-                if inferredW < 1 then inferredW = 1 end
-                if inferredW > MAX_MAP_TILES_PER_AXIS then inferredW = MAX_MAP_TILES_PER_AXIS end
-                mapDimWidth.textNoNotify = tostring(inferredW)
-                importPanel:SetMapDimensions(inferredW, val)
-            else
-                local wVal = tonumber(mapDimWidth.text)
-                if wVal ~= nil and wVal >= 1 and wVal == math.floor(wVal) then
-                    if wVal > MAX_MAP_TILES_PER_AXIS then
-                        wVal = MAX_MAP_TILES_PER_AXIS
-                        mapDimWidth.textNoNotify = tostring(wVal)
-                    end
-                    importPanel:SetMapDimensions(wVal, val)
-                end
-            end
-        end
-
-        mapDimInfoLabel:FireEvent("updateInfo")
-    end
-
-    mapDimWidth = gui.Input{
-        fontSize = 16,
-        width = 80,
-        height = 24,
-        placeholderText = "width",
-        edit = function(element)
-            onMapDimEdit("width", tonumber(element.text))
-        end,
-        change = function(element)
-            onMapDimEdit("width", tonumber(element.text))
-        end,
-    }
-
-    mapDimHeight = gui.Input{
-        fontSize = 16,
-        width = 80,
-        height = 24,
-        placeholderText = "height",
-        edit = function(element)
-            onMapDimEdit("height", tonumber(element.text))
-        end,
-        change = function(element)
-            onMapDimEdit("height", tonumber(element.text))
-        end,
-    }
-
-    mapDimInfoLabel = gui.Label{
-        width = 280,
-        height = "auto",
-        fontSize = 14,
-        text = "",
-
-        updateInfo = function(element)
-            local wVal = tonumber(mapDimWidth.text)
-            local hVal = tonumber(mapDimHeight.text)
-            local imgW, imgH = getImageDim()
-            if wVal and hVal and wVal >= 1 and hVal >= 1 and imgW then
-                local tileW = imgW / wVal
-                local tileH = imgH / hVal
-                local txt = string.format("Tile size: %.1f x %.1f px", tileW, tileH)
-                if wVal >= MAX_MAP_TILES_PER_AXIS or hVal >= MAX_MAP_TILES_PER_AXIS then
-                    txt = txt .. string.format("\n<color=#ffaa55>Clamped at %d tiles per axis.</color>", MAX_MAP_TILES_PER_AXIS)
-                end
-                element.text = txt
-            else
-                element.text = ""
-            end
-        end,
-    }
-
-    mapDimPanel = gui.Panel{
-        classes = {"hidden"},
-        flow = "vertical",
-        width = "auto",
-        height = "auto",
-
-        gui.Panel{
-            flow = "horizontal",
-            width = "auto",
-            height = "auto",
-            gui.Label{
-                width = 90,
-                height = "auto",
-                text = "Width:",
-                fontSize = 18,
-            },
-            mapDimWidth,
-            gui.Label{
-                width = "auto",
-                height = "auto",
-                text = " tiles",
-                fontSize = 18,
-            },
-        },
-
-        gui.Panel{
-            flow = "horizontal",
-            width = "auto",
-            height = "auto",
-            gui.Label{
-                width = 90,
-                height = "auto",
-                text = "Height:",
-                fontSize = 18,
-            },
-            mapDimHeight,
-            gui.Label{
-                width = "auto",
-                height = "auto",
-                text = " tiles",
-                fontSize = 18,
-            },
-        },
-
-        mapDimInfoLabel,
-    }
-
-    local dimModeChoice = gui.EnumeratedSliderControl{
-        options = {
-            {id = "tile", text = "Tile Dimensions"},
-            {id = "map", text = "Map Dimensions"},
-        },
-
-        width = 280,
-
-        value = cond(inferredMapW ~= nil, "map", "tile"),
-
-        change = function(element)
-            dimMode = element.value
-            tileDimPanel:SetClass("hidden", dimMode ~= "tile")
-            mapDimPanel:SetClass("hidden", dimMode ~= "map")
-        end,
-
-        create = function(element)
-            dimMode = element.value
-            tileDimPanel:SetClass("hidden", dimMode ~= "tile")
-            mapDimPanel:SetClass("hidden", dimMode ~= "map")
-        end,
-
-        vmargin = 4,
-    }
-
-    local statusPanel = gui.Panel{
-        classes = {"hidden"},
-        flow = "vertical",
-        width = "auto",
-        height = "auto",
-        halign = "left",
-        valign = "center",
-
-        dimModeChoice,
-
-        tileDimPanel,
-        mapDimPanel,
-
-        --some padding.
-        gui.Panel{
-            width = 1,
-            height = 40,
-        },
-
-        gui.Panel{
-            classes = {cond(tileType == "squares", nil, "hidden")},
-            flow = "horizontal",
-            width = "auto",
-            height = "auto",
-            gui.Label{
-                classes = {"sizeL"},
-                hmargin = 4,
-                width = "auto",
-                height = "auto",
-                text = "1 tile = ",
-            },
-
-            gui.Input{
-                characterLimit = 3,
-                width = 90,
-                text = tostring(MeasurementSystem.NativeToDisplayString(dmhub.unitsPerSquare)),
-                edit = function(element)
-                    local num = MeasurementSystem.DisplayToNative(tonumber(element.text))
-                    if num ~= nil then
-                        num = math.floor(num)
-                    end
-                    if num == nil or num%dmhub.unitsPerSquare ~= 0 or num <= 0 then
-                        element.parent.parent:FireEventTree("scalingError")
-                        return
-                    end
-
-                    element:FireEvent("change")
-                end,
-                change = function(element)
-                    if importPanel == nil then
-                        return
-                    end
-                    local num = MeasurementSystem.DisplayToNative(tonumber(element.text))
-                    if num ~= nil then
-                        num = math.floor(num)
-                    end
-                    if num == nil or num%dmhub.unitsPerSquare ~= 0 or num <= 0 then
-                        element.text = tostring(MeasurementSystem.NativeToDisplayString(importPanel.tileScaling*dmhub.unitsPerSquare))
-                        element.parent.parent:FireEventTree("updateScaling")
-                        return
-                    end
-
-                    importPanel.tileScaling = num/dmhub.unitsPerSquare
-                    element.text = tostring(MeasurementSystem.NativeToDisplayString(importPanel.tileScaling*dmhub.unitsPerSquare))
-                    element.parent.parent:FireEventTree("updateScaling")
-                end,
-            },
-            
-            gui.Label{
-                classes = {"sizeL"},
-                lmargin = 4,
-                width = "auto",
-                height = "auto",
-                text = string.format(" %s", string.lower(MeasurementSystem.UnitName())),
-            },
-        },
-
-        gui.Label{
-            classes = {"form", "sizeL"},
-            tmargin = 8,
-            lmargin = 52,
-            width = 280,
-            height = "auto",
-            create = function(element)
-                element:FireEvent("updateScaling")
-            end,
-
-            updateScaling = function(element)
-                if importPanel.tileScaling == 1 then
-                    element.text = "A tile in the imported map will become 1 tile in DMHub."
-                    return
-                end
-
-                element.text = string.format("A tile in the imported map will become %dx%d tiles in DMHub.", importPanel.tileScaling, importPanel.tileScaling)
-            end,
-
-            scalingError = function(element)
-                element.text = string.format("Enter a multiple of %s", tostring(MeasurementSystem.CurrentSystem().tileSize))
-            end,
-
-        }
-    }
-
-    local layerIndex = 1
-
-    local layersPagingPanel
-    if #paths > 1 then
-        layersPagingPanel = gui.Panel{
-            flow = "horizontal",
-            width = "auto",
-            height = "auto",
-            valign = "top",
-            halign = "center",
-
-            gui.PagingArrow{
-                facing = -1,
-                height = 24,
-                press = function(element)
-                    layerIndex = layerIndex-1
-                    if layerIndex == 0 then
-                        layerIndex = #paths
-                    end
-
-                    resultPanel:FireEventTree("refresh")
-                end,
-            },
-
-            gui.Label{
-                width = 160,
-                height = 20,
-                fontSize = 14,
-                textAlignment = "center",
-
-                refresh = function(element)
-                    element.text = string.format("Layer %d/%d", layerIndex, #paths)
-                end,
-            },
-
-            gui.PagingArrow{
-                facing = 1,
-                height = 24,
-                press = function(element)
-                    layerIndex = layerIndex+1
-                    if layerIndex == #paths+1 then
-                        layerIndex = 1
-                    end
-
-                    resultPanel:FireEventTree("refresh")
-                end,
-            },
-        }
-    end
-
-    local zoomSlider = gui.Slider{
-		style = {
-			height = 20,
-			width = 200,
-			fontSize = 14,
-		},
-        halign = "right",
-        valign = "top",
-        sliderWidth = 140,
-        labelWidth = 60,
-        labelFormat = "percent",
-        minValue = 0,
-        maxValue = 100,
-        value = 100,
-        thinkTime = 0.1,
-        change = function(element)
-            importPanel.zoom = element.value*0.01
-        end,
-        think = function(element)
-            if not element.dragging then
-                element.data.setValueNoEvent(importPanel.zoom*100)
-            end
-        end,
-
-    }
-
-    importPanel = gui.MapImport{
-        paths = paths,
-        width = 800,
-        height = 800,
-        halign = "right",
-        valign = "top",
-        y = 26,
-
-        tileType = tileType,
-
-        refresh = function(element)
-            element.pathIndex = layerIndex
-        end,
-
-        thinkTime = 0.05,
-
-        think = function(element)
-            -- One-shot 140 PPS detection.
-            if not perfectFitChecked and not options.floorImport and tileType == "squares" then
-                local imgW = element.imageWidth
-                local imgH = element.imageHeight
-                if imgW ~= nil and imgW > 0 and imgH ~= nil and imgH > 0 then
-                    perfectFitChecked = true
-                    local pps = 140
-                    local tilesW = imgW / pps
-                    local tilesH = imgH / pps
-                    local rW = math.abs(tilesW - math.floor(tilesW + 0.5))
-                    local rH = math.abs(tilesH - math.floor(tilesH + 0.5))
-                    if rW < 0.01 and rH < 0.01 then
-                        tilesW = math.floor(tilesW + 0.5)
-                        tilesH = math.floor(tilesH + 0.5)
-                        if tilesW >= 1 and tilesH >= 1
-                           and tilesW <= MAX_MAP_TILES_PER_AXIS
-                           and tilesH <= MAX_MAP_TILES_PER_AXIS then
-                            perfectFitActive = true
-
-                            -- Configure the grid preview at detected dimensions.
-                            element:CreateGridless()
-                            element:SetMapDimensions(tilesW, tilesH)
-
-                            -- Populate the panel text.
-                            perfectFitPanel:Get("perfectFitDescription").text = string.format(
-                                "This image is %dx%d pixels, which perfectly fits a %dx%d tile grid at 140 pixels per square -- the standard used by most professional map creators.",
-                                imgW, imgH, tilesW, tilesH
-                            )
-                            perfectFitPanel:Get("perfectFitDimensions").text = string.format(
-                                "%d x %d tiles", tilesW, tilesH
-                            )
-
-                            -- Show perfect fit panel, hide normal instructions.
-                            perfectFitPanel:SetClass("hidden", false)
-                            instructionsPanel:SetClass("hidden", true)
-                        end
-                    end
-                end
-            end
-
-            -- While perfect fit is active, hide the normal calibration controls.
-            if perfectFitActive then
-                previousButton:SetClass("hidden", true)
-                continueButton:SetClass("hidden", true)
-                confirmButton:SetClass("hidden", true)
-                statusPanel:SetClass("hidden", true)
-                return
-            end
-
-            gridlessChoice:SetClass("hidden", gridlessChoice.value and (element.haveNext or element.havePrevious or element.haveConfirm or not string.starts_with(element.instructionsText, "Pick a grid square")))
-            previousButton:SetClass("hidden", not element.havePrevious)
-            continueButton:SetClass("hidden", not element.haveNext)
-            confirmButton:SetClass("hidden", not element.haveConfirm)
-
-            -- Show/hide "Match Existing Map" panel for floor imports.
-            if matchMapPanel ~= nil then
-                local inSizing = element.haveNext or element.havePrevious or element.haveConfirm
-                local imgW = element.imageWidth
-                local imgH = element.imageHeight
-                local haveImg = imgW ~= nil and imgW > 0 and imgH ~= nil and imgH > 0
-                local showMatch = haveImg and not inSizing and not matchApplied
-                matchMapPanel:SetClass("hidden", not showMatch)
-                if showMatch then
-                    matchMapPanel:FireEvent("updateMatchInfo", imgW, imgH)
-                end
-            end
-            instructionsText.text = element.instructionsText
-
-            local tileDim = element.tileDim
-            if tileDim == nil then
-                statusPanel:SetClass("hidden", true)
-            else
-                statusPanel:SetClass("hidden", false)
-
-                -- Show the mode toggle only in gridless mode.
-                local isGridless = gridlessChoice.value == false
-                dimModeChoice:SetClass("hidden", not isGridless)
-                -- In grid mode, always show tile dimensions.
-                if not isGridless then
-                    tileDimPanel:SetClass("hidden", false)
-                    mapDimPanel:SetClass("hidden", true)
-                end
-
-                if (not statusWidth.hasInputFocus) and (not statusHeight.hasInputFocus) then
-                    statusWidth.textNoNotify = string.format("%.2f", tileDim.x)
-                    statusHeight.textNoNotify = string.format("%.2f", tileDim.y)
-                end
-
-                -- Apply inferred dimensions from filename on first availability.
-                local imgW = element.imageWidth
-                local imgH = element.imageHeight
-                local haveImageDim = imgW ~= nil and imgW > 0 and imgH ~= nil and imgH > 0
-
-                if inferredMapW ~= nil and haveImageDim then
-                    local w, h = inferredMapW, inferredMapH
-                    inferredMapW, inferredMapH = nil, nil
-                    mapWidthTouched = true
-                    mapHeightTouched = true
-                    mapDimWidth.textNoNotify = tostring(w)
-                    mapDimHeight.textNoNotify = tostring(h)
-                    element:SetMapDimensions(w, h)
-                end
-
-                -- Update map dimension display from current tile dims (only when user is not editing).
-                if haveImageDim and (not mapDimWidth.hasInputFocus) and (not mapDimHeight.hasInputFocus) and dimMode ~= "map" then
-                    mapDimWidth.textNoNotify = string.format("%d", math.floor(imgW / tileDim.x + 0.5))
-                    mapDimHeight.textNoNotify = string.format("%d", math.floor(imgH / tileDim.y + 0.5))
-                end
-
-                mapDimInfoLabel:FireEvent("updateInfo")
-            end
-
-            if element.error ~= nil then
-                resultPanel.children = {
-                    ErrorPanel(string.format("Error: %s", element.error))
-                }
-                return
-
-            end
-        end,
-    }
-
-    importPanel.pathIndex = layerIndex
-
-    resultPanel = gui.Panel{
-        width = "100%",
-        height = "100%",
-        bgimage = "panels/square.png",
-        flow = "none",
-        zoomSlider,
-        layersPagingPanel,
-        importPanel,
-        buttonsPanel,
-        instructionsPanel,
-        perfectFitPanel,
-        statusPanel,
-    }
-
-    if importPanel.errorMessage ~= nil then
-        local msg = importPanel.errorMessage
-        resultPanel.children = {
-            gui.Label{
-                halign = "center",
-                valign = "center",
-                width = "auto",
-                height = "auto",
-                fontSize = 18,
-                text = importPanel.errorMessage
-            }
-        }
-    end
-
-    resultPanel:FireEventTree("refresh")
-
-    return resultPanel
+    end)
 end
+
+----------------------------------------------------------------------------
+-- Asset picker helpers
+----------------------------------------------------------------------------
 
 local function CountImportFeatures(uvttData)
     local counts = {
@@ -1393,7 +1366,7 @@ local function CountImportFeatures(uvttData)
     end
     addOne(uvttData)
     if type(uvttData) == "table" then
-        for _,d in ipairs(uvttData) do
+        for _, d in ipairs(uvttData) do
             addOne(d)
         end
     end
@@ -2147,7 +2120,7 @@ local function BuildSearchableThumbnailPicker(opts)
     return panel, setSelection
 end
 
-mod.shared.ShowMapAssetPickerDialog = function(uvttData, callback)
+MapImportPlus.ShowMapAssetPickerDialog = function(uvttData, callback)
     local wallId        = dmhub.GetSettingValue("mapimport:wall_asset_id")
     local objectWallId  = dmhub.GetSettingValue("mapimport:object_wall_asset_id")
     local terrainWallId = dmhub.GetSettingValue("mapimport:terrain_wall_asset_id")
@@ -3125,7 +3098,7 @@ mod.shared.ShowMapAssetPickerDialog = function(uvttData, callback)
 
     local dialogPanel
     dialogPanel = gui.Panel{
-        id = "MapAssetPickerDialog",
+        id = "MapAssetPickerDialogPlus",
         classes = {"framedPanel"},
         width = PICKER_UI.dialogWidth,
         height = PICKER_UI.dialogHeight,
@@ -3301,9 +3274,9 @@ end
 
 local UVTT_EXTENSIONS = {".dd2vtt", ".uvtt", ".json"}
 
-local function PathHasExtension(path, extensions)
+local function IsUVTTPath(path)
     local lower = string.lower(tostring(path or ""))
-    for _, ext in ipairs(extensions) do
+    for _, ext in ipairs(UVTT_EXTENSIONS) do
         if string.ends_with(lower, ext) then
             return true
         end
@@ -3312,207 +3285,241 @@ local function PathHasExtension(path, extensions)
     return false
 end
 
-local function IsUVTTPath(path)
-    return PathHasExtension(path, UVTT_EXTENSIONS)
-end
+----------------------------------------------------------------------------
+-- File-drop wizard (UVTT-only). For image-only flows the user should
+-- continue using the Codex's built-in "Create Map" -> "Import" path; this
+-- mod intentionally does NOT duplicate the image-alignment dialog.
+----------------------------------------------------------------------------
 
 local function ImportMapWizard(options)
 
-    local imagesOnly = cond(options.imagesOnly, true, false)
-    local allowUVTT = not imagesOnly
+    local mapName = options.mapName or "Imported Map+"
 
-	local contentPanel
+    local contentPanel
 
-	contentPanel = gui.Panel{
-		width = "95%",
-		height = "94%",
-		halign = "center",
-		valign = "bottom",
-		flow = "vertical",
+    contentPanel = gui.Panel{
+        width = "95%",
+        height = "94%",
+        halign = "center",
+        valign = "bottom",
+        flow = "vertical",
 
-		processFiles = function(element, paths)
-			if paths ~= nil and #paths > 0 then
-                if #paths > 12 then
+        processFiles = function(element, paths)
+            if paths == nil or #paths == 0 then
+                return
+            end
+            if #paths > 12 then
+                gui.ModalMessage{
+                    title = "Error Importing",
+                    message = "Cannot import more than 12 layers.",
+                }
+                return
+            end
+
+            if not IsUVTTPath(paths[1]) then
+                gui.ModalMessage{
+                    title = "Map Import+",
+                    message = "MapImportPlus only handles .dd2vtt / .uvtt / .json files. Use the Codex's built-in Create Map dialog for image imports.",
+                }
+                return
+            end
+
+            for _, path in ipairs(paths) do
+                if not IsUVTTPath(path) then
                     gui.ModalMessage{
                         title = "Error Importing",
-                        message = "Cannot import more than 12 layers.",
+                        message = "Cannot import layers of mixed file types.",
                     }
                     return
                 end
+            end
 
-                if allowUVTT and IsUVTTPath(paths[1]) then
-                    for _,path in ipairs(paths) do
-                        if not IsUVTTPath(path) then
-                            gui.ModalMessage{
-                                title = "Error Importing",
-                                message = "Cannot import layers of mixed file types.",
-                            }
-                            return
-                        end
+            assets:ImportUniversalVTT(paths, function(info)
+                MapImportPlus.ShowMapAssetPickerDialog(info.uvttData, function(choices)
+                    if choices == nil then
+                        return
                     end
-                    assets:ImportUniversalVTT(paths, function(info)
-                        mod.shared.ShowMapAssetPickerDialog(info.uvttData, function(choices)
-                            if choices == nil then
-                                return
-                            end
-                            info.assetChoices = choices
-                            if options.finish ~= nil then
-                                options.finish(info)
-                                gui.CloseModal()
-                            end
-                        end)
-                    end,
-                    function(error)
-                        gui.ModalMessage{
-                            title = "Error Importing",
-                            message = error,
-                        }
-                    end)
-                else
+                    info.assetChoices = choices
+                    MapImportPlus.FinishMapImport(mapName, info)
+                    gui.CloseModal()
+                end)
+            end,
+            function(err)
+                gui.ModalMessage{
+                    title = "Error Importing",
+                    message = err,
+                }
+            end)
+        end,
 
-                    for _,path in ipairs(paths) do
-                        if IsUVTTPath(path) then
-                            gui.ModalMessage{
-                                title = "Error Importing",
-                                message = "Cannot import layers of mixed file types.",
-                            }
-                            return
-                        end
-                    end
+        gui.Panel{
+            classes = "dropArea",
+            bgimage = "panels/square.png",
 
-                    contentPanel.children = {mod.shared.ImportMapDialog(paths, options)}
-                end
-			end
-		end,
+            dragAndDropExtensions = {".dd2vtt", ".uvtt", ".json"},
 
-		gui.Panel{
-			classes = "dropArea",
-			bgimage = "panels/square.png",
+            dropfiles = function(element, paths)
+                contentPanel:FireEvent("processFiles", paths)
+            end,
 
-			dragAndDropExtensions = cond(allowUVTT,
-              {".png", ".jpg", ".jpeg", ".mp4", ".webm", ".webp", ".dd2vtt", ".uvtt", ".json"},
-              {".png", ".jpg", ".jpeg", ".mp4", ".webm", ".webp"}),
+            styles = ThemeEngine.MergeTokens({
+                {
+                    width = "80%",
+                    height = "60%",
+                    valign = "center",
+                    selectors = {"dropArea"},
+                    bgcolor = "@bgAlt",
+                    borderColor = "@border",
+                    borderWidth = 6,
+                    cornerRadius = 16,
+                },
+                {
+                    selectors = {"dropArea","hover"},
+                    bgcolor = "@accent",
+                }
+            }),
 
-			dropfiles = function(element, paths)
-				contentPanel:FireEvent("processFiles", paths)
-			end,
+            gui.Label{
+                fontSize = 22,
+                width = "auto",
+                height = "auto",
+                halign = "center",
+                valign = "center",
+                textAlignment = "center",
+                text = "Drag & drop one or more .dd2vtt / .uvtt files here.\nMultiple files become a multi-floor map (max 12).\nProduced by scripts/fvtt_to_uvtt.py or Dungeondraft.",
+            },
+        },
 
-			styles = ThemeEngine.MergeTokens({
-				{
-					width = "80%",
-					height = "60%",
-					valign = "center",
-					selectors = {"dropArea"},
-					bgcolor = "@bgAlt",
-					borderColor = "@border",
-					borderWidth = 6,
-					cornerRadius = 16,
-				},
-				{
-					selectors = {"dropArea","hover"},
-					bgcolor = "@accent",
-				}
+        gui.Label{
+            valign = "center",
+            halign = "center",
+            fontSize = 16,
+            width = "auto",
+            height = "auto",
+            text = "-or-",
+        },
 
-			}),
+        gui.Panel{
+            width = "auto",
+            height = "auto",
+            halign = "center",
+            flow = "horizontal",
 
-			gui.Label{
-				fontSize = 24,
-				width = "auto",
-				height = "auto",
-				halign = "center",
-				valign = "center",
-				text = cond(allowUVTT, "Drag & Drop image, video, or vtt files here.\nMultiple files will create a multi-floor map.",
-                                       "Drag & Drop image or video file here."),
-			},
-		},
+            gui.Input{
+                classes = {"form"},
+                text = mapName,
+                width = 320,
+                hmargin = 8,
+                change = function(element)
+                    mapName = element.text
+                end,
+            },
 
-		gui.Label{
-			valign = "center",
-			halign = "center",
-			fontSize = 16,
-			width = "auto",
-			height = "auto",
-			text = "-or-",
-		},
+            gui.Button{
+                classes = {"sizeL"},
+                text = "Choose Files",
+                click = function(element)
+                    dmhub.OpenFileDialog{
+                        id = "MapImportPlusFile",
+                        extensions = {"dd2vtt", "uvtt", "json"},
+                        multiFiles = true,
+                        prompt = "Choose one or more UVTT files. Multiple files become a multi-floor map.",
+                        openFiles = function(paths)
+                            contentPanel:FireEvent("processFiles", paths)
+                        end,
+                    }
+                end,
+            },
+        },
+    }
 
-		gui.Button{
-			classes = {"sizeL"},
-			text = "Choose Files",
-			click = function(element)
+    local dialogPanel
+    dialogPanel = gui.Panel{
+        id = "MapImportPlusDialog",
+        classes = {"framedPanel"},
+        width = 1200,
+        height = 700,
+        pad = 8,
+        flow = "vertical",
+        styles = ThemeEngine.GetStyles(),
 
-				dmhub.OpenFileDialog{
-					id = "ObjectImagePath",
-					extensions = cond(allowUVTT, {"jpeg", "jpg", "png", "mp4", "webm", "webp", "dd2vtt", "uvtt", "json"}, {"jpeg", "jpg", "png", "mp4", "webm", "webp"}),
-					multiFiles = true,
-					prompt = cond(allowUVTT, "Choose image, video, or vtt file to use as map.", "Choose image or video file to use as a map."),
-					openFiles = function(paths)
-						contentPanel:FireEvent("processFiles", paths)
+        gui.Label{
+            classes = {"dialogTitle"},
+            text = "Map Import+ (test mod)",
+        },
 
-					end,
-				}
+        contentPanel,
 
-			end,
-		}
+        gui.Button{
+            classes = {"closeButton"},
+            halign = "right",
+            valign = "top",
+            floating = true,
+            escapeActivates = true,
+            escapePriority = EscapePriority.EXIT_MODAL_DIALOG,
+            click = gui.CloseModal,
+        },
+    }
 
-	}
-
-	local dialogPanel
-	dialogPanel = gui.Panel{
-		id = "ImportMapDialog",
-		classes = {"framedPanel"},
-		width = 1400,
-		height = 940,
-		pad = 8,
-		flow = "vertical",
-		styles = ThemeEngine.GetStyles(),
-
-		destroy = function(element)
-			if g_modalDialog == element then
-				g_modalDialog = nil
-			end
-		end,
-
-			output = function(element, info)
-				element:FireEventTree("refresh")
-			end,
-
-		gui.Label{
-			classes = {"dialogTitle"},
-			text = "Import Map from Image",
-		},
-
-		contentPanel,
-
-	--gui.ProgressBar{
-	--	width = "80%",
-	--	height = 64,
-	--	value = 0,
-	--	thinkTime = 0.1,
-	--	think = function(element)
-	--		element.value = element.value + 0.01
-	--	end,
-	--},
-
-			gui.Button{
-				classes = {"closeButton"},
-				halign = "right",
-				valign = "top",
-				floating = true,
-				escapeActivates = true,
-				escapePriority = EscapePriority.EXIT_MODAL_DIALOG,
-				click = gui.CloseModal,
-			},
-	}
-
-	gui.ShowModal(dialogPanel, options)
-	g_modalDialog = dialogPanel
-
-    --gets paths at input, ready to go.
-    if options.paths then
-        contentPanel:FireEvent("processFiles", options.paths)
-    end
+    gui.ShowModal(dialogPanel)
 end
 
-mod.shared.ImportMap = function(options)
-	ImportMapWizard(options)
+----------------------------------------------------------------------------
+-- Public entry point
+----------------------------------------------------------------------------
+
+MapImportPlus.Show = function()
+    ImportMapWizard{
+        mapName = "Imported Map+",
+    }
 end
+
+----------------------------------------------------------------------------
+-- Dockable panel registration -- adds a sidebar entry the user can open
+-- to launch the import dialog.
+----------------------------------------------------------------------------
+
+DockablePanel.Register{
+    name = "Map Import+",
+    icon = "icons/standard/Icon_App_Maps.png",
+    notitle = false,
+    vscroll = false,
+    dmonly = true,
+    minHeight = 80,
+    content = function()
+        return gui.Panel{
+            width = "100%",
+            height = "auto",
+            flow = "vertical",
+            halign = "center",
+            pad = 8,
+
+            gui.Label{
+                width = "100%",
+                height = "auto",
+                fontSize = 12,
+                wrap = true,
+                halign = "center",
+                textAlignment = "center",
+                text = "Test mod for upcoming UVTT/Foundry import improvements (asset picker, secret doors, unrecognized-walls option).",
+            },
+
+            -- The dockable panel is narrow, so the sizeL preset font
+            -- overflowed the button bounds. A medium-size button with an
+            -- explicit fontSize and width fits inside any panel width
+            -- comfortably and keeps the label readable.
+            gui.Button{
+                classes = {"sizeM"},
+                halign = "center",
+                vmargin = 8,
+                width = "90%",
+                height = 32,
+                fontSize = 14,
+                text = "Import UVTT Map",
+                click = function()
+                    MapImportPlus.Show()
+                end,
+            },
+        }
+    end,
+}
