@@ -1,0 +1,35 @@
+local mod = dmhub.GetModLoading()
+
+-- ============================================================================
+-- WarmindOverrides.lua
+--
+-- Per-monster override packs: bespoke behavior for monsters whose printed
+-- abilities deserve more than the generic specs (combos, malice plays,
+-- signature sequencing).
+--
+-- STAGE 6 STUB. The generic core must prove itself first; bespoke monsters
+-- are an explicit extension layer on top, never a requirement.
+--
+-- An override pack is just a group of registrations scoped to monster types:
+--
+--   Warmind.RegisterSpec{
+--       id = "ghoul_leap_and_claw",
+--       category = "main",
+--       monsters = {"Ghoul"},
+--       abilities = {"Leap", "Razor Claws"},
+--       description = "Leap onto a target, then claw it.",
+--       score = function(spec, ctx, snapshot, abilities) ... end,
+--       execute = function(spec, ctx, candidate, abilities)
+--           -- Multi-ability combo: pre-answer the prompt the first ability
+--           -- raises, then cast the second.
+--           -- Warmind.Adapter.SetExpectedPrompt(ctx, ctx.token, targets)
+--           ...
+--       end,
+--   }
+--
+--   Warmind.RegisterPrompt{ prompts = {"Ghoul:Invoked Ability"}, handler = ... }
+--
+-- Stage 6 ports the proven bespoke monsters from the old module
+-- (Monster AI/MonsterAIMonsters.lua): Goblin Warrior, Goblin Assassin,
+-- Bugbear Channeler, Ryll, Ghoul, Zombie, Skeleton.
+-- ============================================================================

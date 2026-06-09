@@ -2,36 +2,13 @@
 
 ## Project context
 
-This repository is implementing a new tiny Draw Steel monster AI core.
+See [CLAUDE.md](CLAUDE.md) for the full repository guide (DMHub Lua mod for the Draw Steel game system: module loading, game types, data tables, UI framework, GoblinScript, Lua constraints).
 
-The old DirectorTactics system is being deprecated. It must not be used as the runtime foundation for the new monster AI core. DirectorTactics may be inspected as legacy reference only.
+## Monster AI (active project)
 
-The preferred direction is a small MonsterAI-derived Lua utility selector with explicit contracts, stable reason codes, conservative prompt handling, and optional monster override packs.
+The monster combat AI is being rebuilt as the **Draw Steel Warmind** module. Before doing ANY work related to monster AI, read [Draw Steel Warmind/CLAUDE.md](Draw%20Steel%20Warmind/CLAUDE.md) -- it is the canonical knowledge store: verified engine API surface, architecture contracts, design rules, lessons learned, stage roadmap and status, and test checklists. Do not re-explore the engine for anything already documented there, and update that file when a stage completes.
 
-## Grounding rules
+Legacy systems, for reference only:
 
-- Do not invent module names, test commands, load files, APIs, or repository structure.
-- Before documenting architecture, inspect the repository and cite the actual files you inspected in the generated docs.
-- If a fact is not present in the repository or in docs/ai/research, write `TBD` or `Needs verification`.
-- Do not copy DirectorTactics code into the new core.
-- Do not reintroduce a DirectorTactics-style pipeline, phase bus, resource ledger, or broad encounter-planning framework.
-- Do not implement gameplay behavior during Stage 0.
-- Documentation must separate:
-  - confirmed repository facts
-  - research-derived recommendations
-  - chosen design decisions
-  - open questions
-
-## Stage 0 definition of done
-
-Stage 0 is complete only when:
-- docs/ai/source-facts.md exists.
-- docs/ai/open-questions.md exists.
-- docs/ai/architecture.md exists and is grounded in source-facts.md.
-- docs/ai/migration-plan.md exists.
-- docs/ai/reason-codes.md exists.
-- docs/ai/legacy-directortactics-notes.md exists.
-- No gameplay behavior has changed.
-- No DirectorTactics code has been copied into the new core.
-- Any placeholder Lua modules are syntactically minimal and clearly marked as stubs.
-
+- `Monster AI/` -- the previous AI module. Still loaded and functional; stays until the Warmind Stage 7 cutover. Do not extend it.
+- Root-level `DirectorTactics*.lua` -- an abandoned framework, not loaded by `main.lua`. Never use it as a foundation, never import its code, and never reintroduce its patterns (phase bus, multi-flow pipeline, candidate mega-normalization, resource ledger, manual-handoff runtime).

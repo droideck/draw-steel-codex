@@ -1,0 +1,36 @@
+local mod = dmhub.GetModLoading()
+
+-- ============================================================================
+-- WarmindPrompts.lua
+--
+-- Prompt handlers: resolve secondary targeting choices that come up while an
+-- ability resolves (a Shift destination, a Push/Pull/Slide direction, an
+-- invoked sub-ability's targets).
+--
+-- STAGE 2 STUB. No handlers are registered yet. Until then every prompt an
+-- ability raises falls through to the DM as a manual prompt, traced with
+-- UNSUPPORTED_COMPLEX_PROMPT by the adapter's prompt callback. That is the
+-- intended fail-closed default, not an error.
+--
+-- Handler contract (see Warmind.RegisterPrompt in WarmindCore.lua):
+--
+--   Warmind.RegisterPrompt{
+--       prompts = {"Shift"},                  -- or {"Monster Type:Ability"}
+--       handler = function(ctx, invokerToken, casterToken, abilityClone,
+--                          symbols, options)
+--           -- Compute the answer.
+--           -- return { targets = {{loc = someLoc}} }        location answer
+--           -- return { targets = {{token = someToken}} }    token answer
+--           -- return "skip"                                 abort the prompt
+--           -- return nil                                    decline -> manual
+--       end,
+--   }
+--
+-- Stage 2 ports, with fixes, the baseline handlers:
+--   * Shift: pick a destination that improves safety (the baseline picked a
+--     random reachable tile).
+--   * Push!/Pull!/Slide!: use the ability's real target shape instead of a
+--     fixed square (fixes the baseline TODO), preferring collisions with
+--     enemies and drops, avoiding allies.
+--   * A generic invoked-ability target picker for squad-style invokes.
+-- ============================================================================

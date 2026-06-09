@@ -209,3 +209,26 @@ Key stubs:
 ## Editing Files
 
 Always edit files in the **main copy** of the repository (`D:\dev\dmhub\draw-steel-codex\`), not in any git worktree under `.claude\worktrees\`. Worktrees are used for isolated agent work only; the user works directly from the main copy.
+
+## Working Rules (Core — always in effect)
+
+Task-specific workflows live in `.claude/commands/` (e.g. code review, feature development). Those command files assume this Core section is loaded — they contain only deltas. Session default: high thinking effort; escalate above it only for gnarly debugging or subtle design work.
+
+### Judgment
+1. Unclear intent, architecture, or requirements → ask before writing code. Unattended: take the most reasonable reading, proceed, log it under `ASSUMPTIONS`.
+2. Simplest design that solves the stated problem. No speculative abstraction, config options, or "flexibility for later."
+3. Touch only in-scope code. Smells or design problems you notice → one line each under `FLAGS`. Never fix them drive-by.
+4. State uncertainty explicitly. If it changes the recommendation, run the smallest safe experiment; report hypothesis → result. Calibrated doubt beats confident error.
+5. If a better or longer-lasting approach exists, propose it in ≤3 lines under `ALTERNATIVE`, then do what was asked unless redirected.
+
+### Token discipline
+6. Targeted reads only: `rg -n`, `git grep -n`, `sed -n 'START,ENDp'`. Never `cat` whole files; never paste full command output — quote failing lines only.
+7. Cite evidence as `path:line`. Don't re-quote code the user can open.
+8. Stop gathering evidence once the conclusion is clear. Verify only claims that change the outcome.
+9. External sources: official docs only, ≤8 fetches per task. Unreachable or unchecked → tag `unverified`, don't guess.
+
+### Delegation & continuity
+10. Delegate mechanical, tightly specified work to an Opus subagent: give it a spec + acceptance check. Keep anything requiring design judgment, or whose output you can't fully verify. Review subagent output before integrating.
+11. Instruct subagents to challenge the spec if they spot an error — disagreement is signal, not insubordination.
+12. Execute multi-step plans in-session via subagents; don't tell the user to open a separate session.
+13. Before any pause needing a human, or when context is bloated → write `HANDOFF.md`: goal, state (done/remaining), decisions + why, `ASSUMPTIONS`, open questions, exact next step. A fresh session must be able to resume from it alone.

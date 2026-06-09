@@ -61,3 +61,5 @@ docs/superpowers/
 # Tooling caches
 .superpowers/
 .understand-anything/
+
+*.DS_Stor*
