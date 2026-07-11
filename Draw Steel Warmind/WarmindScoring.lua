@@ -257,6 +257,36 @@ function Scoring.FindBestBurstPosition(ctx, token, ability, scorefn)
     return bestMove, bestScore
 end
 
+-- Finds the lowest-cost reachable tile from which the actor would be
+-- concealed. Returns loc or nil.
+--
+-- Faithful port of the baseline Monster AI FindReachableConcealment
+-- (Monster AI/MonsterAI.lua ~788), used by the Stage 2 hide spec. Read-only:
+-- ExecuteWithTheoreticalLoc is a query that restores the real loc, and
+-- IsConcealed (Draw Steel Core Rules/MCDMCreature.lua ~3200) only reads
+-- token.hasConcealment. The cost check runs BEFORE the theoretical-loc test
+-- (baseline optimization -- strict less): only tiles cheaper than the best
+-- concealed tile found so far are worth evaluating.
+function Scoring.FindReachableConcealment(ctx, snapshot)
+    local token = snapshot.token
+    local bestLoc = nil
+    local bestScore = nil
+    for _,info in pairs(snapshot.paths) do
+        local destLoc = info.loc
+
+        if bestScore == nil or info.cost < bestScore then
+            token:ExecuteWithTheoreticalLoc(destLoc, function()
+                if token.properties:IsConcealed() then
+                    bestLoc = info.loc
+                    bestScore = info.cost
+                end
+            end)
+        end
+    end
+
+    return bestLoc
+end
+
 -- ----------------------------------------------------------------------------
 -- Simple distance helpers used by specs.
 -- ----------------------------------------------------------------------------
@@ -278,3 +308,60 @@ function Scoring.DistanceFromNearestEnemy(ctx, token)
     local _, dist = Scoring.FindClosestEnemy(ctx, token)
     return dist or 999
 end
+
+-- ----------------------------------------------------------------------------
+-- Baseline tactics.
+--
+-- Faithful ports of the three Monster AI baseline tactics
+-- (Monster AI/MonsterAITactics.lua). Each is a passive edge bias consumed by
+-- FindValidStrikeTargets above: Turn.PlayActivation copies every matching
+-- tactic into ctx.activeTactics, and the tactic loop adds each tactic's score
+-- to a candidate target's edge count. Signature (fixed by the registry):
+--   score(tactic, ctx, token, tokenLoc, enemy, ability) -> number|nil
+-- All generic (no monsters array); each contributes +1 edge when its condition
+-- holds and nil otherwise.
+-- ----------------------------------------------------------------------------
+
+Warmind.RegisterTactic{
+    id = "flanking",
+    description = "Prefer positions that flank the target: an ally sits on the exact opposite side of the enemy from the attacker.",
+    score = function(tactic, ctx, token, tokenLoc, enemy, ability)
+        -- Allies come from the snapshot, not a live token scan. The snapshot
+        -- already excludes the actor; the charid guard is kept faithful to the
+        -- baseline and defensive.
+        for _,ally in ipairs(ctx.snapshot.allies) do
+            if ally.charid ~= token.charid and ally:Distance(enemy) <= 1 then
+                if (enemy.loc.y - tokenLoc.y) == (ally.loc.y - enemy.loc.y) and (enemy.loc.x - tokenLoc.x) == (ally.loc.x - enemy.loc.x) then
+                    return 1
+                end
+            end
+        end
+    end,
+}
+
+Warmind.RegisterTactic{
+    id = "aid_attack",
+    description = "Prefer attacking enemies an ally has aided attacks against (aid-attack ongoing effect).",
+    score = function(tactic, ctx, token, tokenLoc, enemy, ability)
+        -- Read the per-enemy flag precomputed once in Snapshot.Build; never
+        -- rescan ActiveOngoingEffects here (this runs per candidate tile x per
+        -- enemy, so a live scan would be quadratic).
+        local map = ctx.snapshot.aidAttacked
+        if map ~= nil and map[enemy.charid] == true then
+            return 1
+        end
+    end,
+}
+
+Warmind.RegisterTactic{
+    id = "high_ground",
+    description = "Prefer attacking from higher ground: the candidate tile's altitude is above the target's.",
+    score = function(tactic, ctx, token, tokenLoc, enemy, ability)
+        -- Altitude is read at the CANDIDATE tile (tokenLoc), not token.loc.
+        local ourAltitude = game.currentFloor:GetAltitudeAtLoc(tokenLoc)
+        local targetAltitude = game.currentFloor:GetAltitudeAtLoc(enemy.loc)
+        if ourAltitude > targetAltitude then
+            return 1
+        end
+    end,
+}

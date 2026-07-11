@@ -19,6 +19,8 @@ local mod = dmhub.GetModLoading()
 --   abilities     array of { ability = ActivatedAbility, traits = table }
 --   enemies       array of CharacterToken (hostile, alive, in initiative)
 --   allies        array of CharacterToken (friendly, alive, in initiative)
+--   aidAttacked   map of enemy charid -> true when that enemy currently
+--                 carries the aid-attack ongoing effect
 --   budget        { hasMainAction, hasManeuver, dazed }
 --   malice        number (shared Director malice pool)
 --   round         number|nil
@@ -67,6 +69,7 @@ function Warmind.Snapshot.Build(token)
         abilities = {},
         enemies = {},
         allies = {},
+        aidAttacked = {},
         budget = BuildBudget(c),
         malice = 0,
         round = nil,
@@ -88,6 +91,9 @@ function Warmind.Snapshot.Build(token)
     -- Partition combatants. Mirrors the proven Monster AI baseline: only
     -- tokens that are part of the current initiative queue count, and
     -- anything not friendly is treated as an enemy.
+    -- WarmindTraits loads before WarmindSnapshot in module load order, so this
+    -- plain read is populated by Build time.
+    local aidAttackGuid = Warmind.Traits.AID_ATTACK_EFFECT_GUID
     if queue ~= nil then
         for _,tok in ipairs(dmhub.allTokens) do
             if tok.valid and tok.properties ~= nil and tok.charid ~= token.charid then
@@ -97,6 +103,19 @@ function Warmind.Snapshot.Build(token)
                         snapshot.allies[#snapshot.allies+1] = tok
                     else
                         snapshot.enemies[#snapshot.enemies+1] = tok
+                        -- One scan per enemy per Build: flag enemies that carry
+                        -- the aid-attack ongoing effect so specs and tactics
+                        -- share this read instead of rescanning. The baseline
+                        -- did this once per turn in PlayTurnCoroutine but stored
+                        -- it by mutating enemy properties (_tmp_ai_aidAttack);
+                        -- Warmind keeps the flag in the snapshot and never
+                        -- mutates engine state here.
+                        for _,effect in ipairs(tok.properties:ActiveOngoingEffects()) do
+                            if effect.ongoingEffectid == aidAttackGuid then
+                                snapshot.aidAttacked[tok.charid] = true
+                                break
+                            end
+                        end
                     end
                 end
             end

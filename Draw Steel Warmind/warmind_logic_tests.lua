@@ -84,6 +84,20 @@ function dmhub.CenterOnToken(id, opts) mark("dmhub.CenterOnToken") end
 function dmhub.SyncCamera(opts) mark("dmhub.SyncCamera") end
 function dmhub.TableToString(t) return "<table>" end
 
+-- Data-table reads (Traits resolves condition ids via "charConditions"; the
+-- ApplyOngoingEffect ConditionID hop uses "characterOngoingEffects", modeled
+-- inside FakeBehavior so the table here stays empty). Same name-space as
+-- creature:HasNamedCondition (matches by lowercased condition.name).
+S.tables = {
+    charConditions = {
+        ["cond-grabbed"] = { name = "Grabbed" },
+        ["cond-hidden"]  = { name = "Hidden" },
+        ["cond-dazed"]   = { name = "Dazed" },
+    },
+    characterOngoingEffects = {},
+}
+function dmhub.GetTable(name) mark("dmhub.GetTable"); return S.tables[name] end
+
 -- settings: setting{} registers a default AND returns a settings object with
 -- :Get()/:Set() (GoblinScript.lua relies on the return value; WarmindCore only
 -- reads back through dmhub.GetSettingValue).
@@ -234,23 +248,49 @@ local function FakeAbility(t)
     return {
         name = t.name,
         targetType = t.targetType or "target",
+        numTargets = t.numTargets or "1",            -- RAW field (engine class default "1")
+        resourceCost = t.resourceCost or "none",     -- RAW field (engine class default "none")
         _actionResource = t.actionResource,          -- resource id or nil
         _categorization = t.categorization,          -- "Signature Ability" | nil
         _villainAction = t.villainAction,            -- "Villain Action 1" | nil
+        _forcedMovement = t.forcedMovement,          -- "push"|"pull"|"slide"|... | nil
+        _behaviors = t.behaviors,                    -- array of FakeBehavior | nil
         _range = t.range or 1,
+        _radius = t.radius,                          -- drives GetRadius | nil
         _numTargets = t.numTargets or 1,
         ActionResource = function(self) return self._actionResource end,
         HasKeyword = function(self, k) return kw[k] == true end,
         try_get = function(self, k, dflt)
             if k == "categorization" then local v = self._categorization; if v == nil then return dflt end; return v end
             if k == "villainAction" then local v = self._villainAction; if v == nil then return dflt end; return v end
+            if k == "forcedMovement" then local v = self._forcedMovement; if v == nil then return dflt end; return v end
+            if k == "behaviors" then local v = self._behaviors; if v == nil then return dflt end; return v end
             if k == "chargeDistanceOverride" then return dflt end
             return dflt
         end,
         GetRange = function(self) return self._range end,
+        GetRadius = function(self, caster, symbols) return self._radius end,
         GetNumTargets = function(self) return self._numTargets end,
         CanAfford = function(self, token) return true end,
         TargetPassesFilter = function(self, caster, tok, symbols) return true end,
+    }
+end
+
+-- FakeBehavior mimics an ActivatedAbilityBehavior entry in ability.behaviors.
+-- typeName drives forced-movement presence; ConditionID returns a configurable
+-- condition id (base engine returns nil); try_get serves the ongoingEffect field
+-- (aid-attack detection compares it against the aid-attack guid).
+local function FakeBehavior(t)
+    t = t or {}
+    return {
+        typeName = t.typeName,
+        _ongoingEffect = t.ongoingEffect,            -- ongoing-effect guid | nil
+        _conditionId = t.conditionId,                -- condition id | nil
+        ConditionID = function(self) return self._conditionId end,
+        try_get = function(self, k, dflt)
+            if k == "ongoingEffect" then local v = self._ongoingEffect; if v == nil then return dflt end; return v end
+            return dflt
+        end,
     }
 end
 
@@ -275,6 +315,7 @@ local function FakeCreature(t)
         DistanceMovedThisTurn = function(self) return 0 end,
         IsDead = function(self) return t.dead == true end,
         MinionSquad = function(self) return t.squad or "Squad 1" end,
+        ActiveOngoingEffects = function(self) return t.ongoingEffects or {} end,
     }
 end
 
@@ -337,6 +378,108 @@ TESTS[#TESTS + 1] = { name = "traits_villain_action", fn = function()
     local tr = Warmind.Traits.Get(ab)
     return (tr.villainAction == "Villain Action 2" and tr.actionKind == "villain"),
         string.format("villainAction=%s actionKind=%s", tostring(tr.villainAction), tostring(tr.actionKind))
+end }
+
+-- (a2) Stage 2 trait expansion: forced movement, conditions, aid attack,
+-- aoe radius, malice cost, raw numTargets.
+
+TESTS[#TESTS + 1] = { name = "traits_forced_movement_typed", fn = function()
+    local ab = FakeAbility{ name = "Shove", keywords = { "Strike", "Melee" }, forcedMovement = "push" }
+    local tr = Warmind.Traits.Get(ab)
+    return tr.forcedMovementType == "push", string.format("forcedMovementType=%s", tostring(tr.forcedMovementType))
+end }
+
+TESTS[#TESTS + 1] = { name = "traits_forced_movement_unknown", fn = function()
+    -- Relocate behavior present but no typed forcedMovement field -> "unknown".
+    local ab = FakeAbility{ name = "Yank", keywords = { "Strike" },
+        behaviors = { FakeBehavior{ typeName = "ActivatedAbilityRelocateCreatureBehavior" } } }
+    local tr = Warmind.Traits.Get(ab)
+    return tr.forcedMovementType == "unknown", string.format("forcedMovementType=%s", tostring(tr.forcedMovementType))
+end }
+
+TESTS[#TESTS + 1] = { name = "traits_forced_movement_absent", fn = function()
+    local ab = FakeAbility{ name = "Poke", keywords = { "Strike", "Melee" } }
+    local tr = Warmind.Traits.Get(ab)
+    return tr.forcedMovementType == nil, string.format("forcedMovementType=%s", tostring(tr.forcedMovementType))
+end }
+
+TESTS[#TESTS + 1] = { name = "traits_forced_movement_self_move_excluded", fn = function()
+    -- A Relocate behavior on a self-space targetType moves the CASTER
+    -- (Charge/Disengage/Move Speed shape, live-verified): NOT forced movement.
+    local ab = FakeAbility{ name = "Charge", keywords = {}, targetType = "emptyspace",
+        behaviors = { FakeBehavior{ typeName = "ActivatedAbilityRelocateCreatureBehavior" } } }
+    local tr = Warmind.Traits.Get(ab)
+    -- But an authored forcedMovement field still wins even on a self-space type.
+    local ab2 = FakeAbility{ name = "Repulse", keywords = {}, targetType = "emptyspace",
+        forcedMovement = "push",
+        behaviors = { FakeBehavior{ typeName = "ActivatedAbilityRelocateCreatureBehavior" } } }
+    local tr2 = Warmind.Traits.Get(ab2)
+    local ok = tr.forcedMovementType == nil and tr2.forcedMovementType == "push"
+    return ok, string.format("selfMove=%s fieldWins=%s",
+        tostring(tr.forcedMovementType), tostring(tr2.forcedMovementType))
+end }
+
+TESTS[#TESTS + 1] = { name = "traits_inflicts_grabbed", fn = function()
+    local ab = FakeAbility{ name = "Snare", keywords = { "Strike", "Melee" },
+        behaviors = { FakeBehavior{ typeName = "ActivatedAbilityApplyOngoingEffectBehavior", conditionId = "cond-grabbed" } } }
+    local tr = Warmind.Traits.Get(ab)
+    local ok = tr.inflictsConditions ~= nil and tr.inflictsConditions["grabbed"] == true
+        and tr.appliesGrabbed == true and tr.isHide == false
+    return ok, string.format("grabbed=%s appliesGrabbed=%s isHide=%s",
+        tostring(tr.inflictsConditions and tr.inflictsConditions["grabbed"]), tostring(tr.appliesGrabbed), tostring(tr.isHide))
+end }
+
+TESTS[#TESTS + 1] = { name = "traits_is_hide", fn = function()
+    local ab = FakeAbility{ name = "Vanish", keywords = {},
+        behaviors = { FakeBehavior{ typeName = "ActivatedAbilityApplyOngoingEffectBehavior", conditionId = "cond-hidden" } } }
+    local tr = Warmind.Traits.Get(ab)
+    local ok = tr.isHide == true and tr.appliesGrabbed == false
+        and tr.inflictsConditions ~= nil and tr.inflictsConditions["hidden"] == true
+    return ok, string.format("isHide=%s hidden=%s appliesGrabbed=%s",
+        tostring(tr.isHide), tostring(tr.inflictsConditions and tr.inflictsConditions["hidden"]), tostring(tr.appliesGrabbed))
+end }
+
+TESTS[#TESTS + 1] = { name = "traits_is_aid_attack", fn = function()
+    local ab = FakeAbility{ name = "Mark Prey", keywords = {},
+        behaviors = { FakeBehavior{ typeName = "ActivatedAbilityApplyOngoingEffectBehavior",
+            ongoingEffect = Warmind.Traits.AID_ATTACK_EFFECT_GUID } } }
+    local tr = Warmind.Traits.Get(ab)
+    -- The aid-attack behavior carries no condition id -> no conditions detected.
+    return (tr.isAidAttack == true and tr.inflictsConditions == nil),
+        string.format("isAidAttack=%s inflictsConditions=%s", tostring(tr.isAidAttack), tostring(tr.inflictsConditions))
+end }
+
+TESTS[#TESTS + 1] = { name = "traits_aoe_radius", fn = function()
+    local ab = FakeAbility{ name = "Blast", keywords = { "Area" }, targetType = "all", radius = 3 }
+    local tr = Warmind.Traits.Get(ab)
+    return (tr.isAoe == true and tr.aoeRadius == 3),
+        string.format("isAoe=%s aoeRadius=%s", tostring(tr.isAoe), tostring(tr.aoeRadius))
+end }
+
+TESTS[#TESTS + 1] = { name = "traits_aoe_radius_nil_non_aoe", fn = function()
+    -- radius present but not an area -> aoeRadius nil (gated on isAoe, not the field).
+    local ab = FakeAbility{ name = "Jab", keywords = { "Strike", "Melee" }, targetType = "target", radius = 3 }
+    local tr = Warmind.Traits.Get(ab)
+    return (tr.isAoe == false and tr.aoeRadius == nil),
+        string.format("isAoe=%s aoeRadius=%s", tostring(tr.isAoe), tostring(tr.aoeRadius))
+end }
+
+TESTS[#TESTS + 1] = { name = "traits_costs_malice", fn = function()
+    local paid = FakeAbility{ name = "Doom Bolt", keywords = { "Ranged" }, resourceCost = CharacterResource.maliceResourceId }
+    local free = FakeAbility{ name = "Plain Shot", keywords = { "Ranged" } }
+    local trPaid = Warmind.Traits.Get(paid)
+    local trFree = Warmind.Traits.Get(free)
+    return (trPaid.costsMalice == true and trFree.costsMalice == false),
+        string.format("paid=%s free=%s", tostring(trPaid.costsMalice), tostring(trFree.costsMalice))
+end }
+
+TESTS[#TESTS + 1] = { name = "traits_raw_num_targets", fn = function()
+    local two = FakeAbility{ name = "Twin Strike", keywords = { "Strike", "Melee" }, numTargets = "2" }
+    local dflt = FakeAbility{ name = "Single", keywords = { "Strike", "Melee" } }
+    local trTwo = Warmind.Traits.Get(two)
+    local trDflt = Warmind.Traits.Get(dflt)
+    return (trTwo.numTargets == "2" and trDflt.numTargets == "1"),
+        string.format("two=%s default=%s", tostring(trTwo.numTargets), tostring(trDflt.numTargets))
 end }
 
 -- (b) DecisionResult constructors + reason codes.
@@ -475,6 +618,164 @@ TESTS[#TESTS + 1] = { name = "goblinscript_wrapper_loads_but_native", fn = funct
     return (hasExec and nativeBound),
         string.format("ExecuteGoblinScript=%s native_compile/eval_reached=%s (compiler is engine-native, NOT pure Lua)",
             tostring(hasExec), tostring(nativeBound))
+end }
+
+-- (f) Scoring.FindReachableConcealment: lowest-cost concealed tile wins; nil
+-- when no reachable tile conceals. IsConcealed is overridden on the fake
+-- creature to key off the token's current loc (ExecuteWithTheoreticalLoc in
+-- FakeToken swaps tok.loc), so the token local is forward-declared.
+TESTS[#TESTS + 1] = { name = "scoring_reachable_concealment", fn = function()
+    if Warmind.Scoring == nil or Warmind.Scoring.FindReachableConcealment == nil then
+        return false, "FindReachableConcealment missing"
+    end
+    local tok
+    -- Concealment only at (2,0) and (3,0); (2,0) is the cheaper of the two.
+    local concealedLocs = { ["2,0"] = true, ["3,0"] = true }
+    local props = FakeCreature{ monster_type = "Skulker" }
+    props.IsConcealed = function(self)
+        local l = tok.loc
+        return concealedLocs[l.x .. "," .. l.y] == true
+    end
+    tok = FakeToken{ charid = "A", loc = { x = 0, y = 0 }, properties = props }
+    local snapshot = {
+        token = tok,
+        paths = {
+            p1 = { loc = { x = 1, y = 0 }, cost = 1 },  -- reachable, not concealed
+            p2 = { loc = { x = 3, y = 0 }, cost = 5 },  -- concealed, costlier
+            p3 = { loc = { x = 2, y = 0 }, cost = 2 },  -- concealed, cheapest concealed
+        },
+    }
+    local best = Warmind.Scoring.FindReachableConcealment({ snapshot = snapshot }, snapshot)
+    local okConcealed = best ~= nil and best.x == 2 and best.y == 0
+    -- The theoretical-loc queries must restore the real loc.
+    local okRestored = tok.loc.x == 0 and tok.loc.y == 0
+    -- No concealing tile anywhere -> nil.
+    concealedLocs = {}
+    local none = Warmind.Scoring.FindReachableConcealment({ snapshot = snapshot }, snapshot)
+    local ok = okConcealed and okRestored and none == nil
+    return ok, string.format("best=%s restored=%s none=%s",
+        best and (best.x .. "," .. best.y) or "nil", tostring(okRestored), tostring(none))
+end }
+
+-- (f2) flanking tactic scored directly: exact-opposite geometry -> 1;
+-- non-collinear control -> falsy.
+TESTS[#TESTS + 1] = { name = "tactic_flanking_direct", fn = function()
+    local flanking = Warmind.tactics and Warmind.tactics["flanking"]
+    if flanking == nil then return false, "flanking tactic not registered" end
+    local attacker = FakeToken{ charid = "A", loc = { x = 0, y = 0 }, properties = FakeCreature{} }
+    local enemy = FakeToken{ charid = "E", loc = { x = 1, y = 0 }, properties = FakeCreature{} }
+    local allyOpp = FakeToken{ charid = "AL", loc = { x = 2, y = 0 }, properties = FakeCreature{} }
+    local allyOff = FakeToken{ charid = "AL", loc = { x = 2, y = 1 }, properties = FakeCreature{} }
+    local hit = flanking.score(flanking, { snapshot = { allies = { allyOpp } } }, attacker, attacker.loc, enemy, nil)
+    local miss = flanking.score(flanking, { snapshot = { allies = { allyOff } } }, attacker, attacker.loc, enemy, nil)
+    local ok = hit == 1 and (not miss)
+    return ok, string.format("hit=%s miss=%s", tostring(hit), tostring(miss))
+end }
+
+-- (f3) aid_attack tactic scored directly: 1 when the enemy charid carries the
+-- flag; falsy when the map is empty AND when it is nil.
+TESTS[#TESTS + 1] = { name = "tactic_aid_attack_direct", fn = function()
+    local aid = Warmind.tactics and Warmind.tactics["aid_attack"]
+    if aid == nil then return false, "aid_attack tactic not registered" end
+    local attacker = FakeToken{ charid = "A", loc = { x = 0, y = 0 }, properties = FakeCreature{} }
+    local enemy = FakeToken{ charid = "E", loc = { x = 1, y = 0 }, properties = FakeCreature{} }
+    local hit = aid.score(aid, { snapshot = { aidAttacked = { E = true } } }, attacker, attacker.loc, enemy, nil)
+    local empty = aid.score(aid, { snapshot = { aidAttacked = {} } }, attacker, attacker.loc, enemy, nil)
+    local nilmap = aid.score(aid, { snapshot = {} }, attacker, attacker.loc, enemy, nil)
+    local ok = hit == 1 and (not empty) and (not nilmap)
+    return ok, string.format("hit=%s empty=%s nil=%s", tostring(hit), tostring(empty), tostring(nilmap))
+end }
+
+-- (f4) high_ground tactic scored directly, with GetAltitudeAtLoc temporarily
+-- overridden (restored after the test whatever the outcome): candidate above
+-- target -> 1, equal -> falsy.
+TESTS[#TESTS + 1] = { name = "tactic_high_ground_direct", fn = function()
+    local hg = Warmind.tactics and Warmind.tactics["high_ground"]
+    if hg == nil then return false, "high_ground tactic not registered" end
+    local attacker = FakeToken{ charid = "A", loc = { x = 0, y = 0 }, properties = FakeCreature{} }
+    local savedAlt = game.currentFloor.GetAltitudeAtLoc
+    game.currentFloor.GetAltitudeAtLoc = function(self, loc) return loc.alt or 0 end
+    local highTile = { x = 0, y = 0, alt = 5 }
+    local lowEnemy = FakeToken{ charid = "E", loc = { x = 1, y = 0, alt = 0 }, properties = FakeCreature{} }
+    local levelEnemy = FakeToken{ charid = "E2", loc = { x = 1, y = 0, alt = 5 }, properties = FakeCreature{} }
+    -- pcall so the global stub is restored even if score throws (a throw would
+    -- otherwise leak the override into later tests via the runner's pcall).
+    local okCall, higher, equal = pcall(function()
+        local h = hg.score(hg, { snapshot = {} }, attacker, highTile, lowEnemy, nil)
+        local e = hg.score(hg, { snapshot = {} }, attacker, highTile, levelEnemy, nil)
+        return h, e
+    end)
+    game.currentFloor.GetAltitudeAtLoc = savedAlt  -- restore whatever the outcome
+    if not okCall then return false, "score error: " .. tostring(higher) end
+    local ok = higher == 1 and (not equal)
+    return ok, string.format("higher=%s equal=%s", tostring(higher), tostring(equal))
+end }
+
+-- (f5) Tactic edge integration through FindValidStrikeTargets: a flanking ally
+-- adds +1 to the target's edge count; removing the ally drops it back to 0.
+TESTS[#TESTS + 1] = { name = "tactic_edges_integration", fn = function()
+    local flanking = Warmind.tactics and Warmind.tactics["flanking"]
+    if flanking == nil then return false, "flanking tactic not registered" end
+    local attacker = FakeToken{ charid = "A", loc = { x = 0, y = 0 }, properties = FakeCreature{ monster_type = "Goblin" } }
+    local enemy = FakeToken{ charid = "E", loc = { x = 1, y = 0 }, properties = FakeCreature{} }
+    local ally = FakeToken{ charid = "AL", loc = { x = 2, y = 0 }, properties = FakeCreature{} }
+    local ability = FakeAbility{ name = "Claw", keywords = { "Strike", "Melee" }, range = 1 }
+    local ctxHit = {
+        snapshot = { enemies = { enemy }, allies = { ally } },
+        activeTactics = { flanking = flanking },
+    }
+    local hit = Warmind.Scoring.FindValidStrikeTargets(ctxHit, attacker, ability, attacker.loc, 1)
+    local ctxMiss = {
+        snapshot = { enemies = { enemy }, allies = {} },
+        activeTactics = { flanking = flanking },
+    }
+    local miss = Warmind.Scoring.FindValidStrikeTargets(ctxMiss, attacker, ability, attacker.loc, 1)
+    local ok = #hit == 1 and hit[1].edges == 1 and #miss == 1 and miss[1].edges == 0
+    return ok, string.format("hitEdges=%s missEdges=%s (expect 1 / 0)",
+        hit[1] and tostring(hit[1].edges) or "nil", miss[1] and tostring(miss[1].edges) or "nil")
+end }
+
+-- (f6) The three baseline tactics are registered in the tactics registry.
+TESTS[#TESTS + 1] = { name = "baseline_tactics_registered", fn = function()
+    local t = Warmind.tactics or {}
+    local ok = t["flanking"] ~= nil and t["aid_attack"] ~= nil and t["high_ground"] ~= nil
+    return ok, string.format("flanking=%s aid_attack=%s high_ground=%s",
+        tostring(t["flanking"] ~= nil), tostring(t["aid_attack"] ~= nil), tostring(t["high_ground"] ~= nil))
+end }
+
+-- (g) Snapshot.Build tags enemies carrying the aid-attack ongoing effect,
+-- and only those enemies (Workstream C: one scan per enemy per Build).
+TESTS[#TESTS + 1] = { name = "snapshot_aid_attacked", fn = function()
+    if Warmind.Snapshot == nil then return false, "Warmind.Snapshot missing" end
+    local guid = Warmind.Traits.AID_ATTACK_EFFECT_GUID
+    if guid == nil then return false, "AID_ATTACK_EFFECT_GUID missing" end
+    local actor = FakeToken{ charid = "A", loc = { x = 0, y = 0 },
+        properties = FakeCreature{ monster_type = "Goblin" } }
+    local aided = FakeToken{ charid = "E_AID", loc = { x = 1, y = 0 }, initiativeId = "iaid",
+        playerControlled = true,
+        properties = FakeCreature{ ongoingEffects = { { ongoingEffectid = guid } } } }
+    local plain = FakeToken{ charid = "E_PLAIN", loc = { x = 2, y = 0 }, initiativeId = "iplain",
+        playerControlled = true,
+        properties = FakeCreature{ ongoingEffects = { { ongoingEffectid = "some-other-guid" } } } }
+
+    local saveTokens, saveQueue = dmhub.allTokens, dmhub.initiativeQueue
+    dmhub.allTokens = { aided, plain }
+    dmhub.initiativeQueue = {
+        entries = { iaid = true, iplain = true },
+        try_get = function(self, k, dflt) return dflt end,
+    }
+    local okBuild, snapOrErr = pcall(Warmind.Snapshot.Build, actor)
+    dmhub.allTokens, dmhub.initiativeQueue = saveTokens, saveQueue
+    if not okBuild then return false, "Build error: " .. tostring(snapOrErr) end
+    local snap = snapOrErr
+
+    local aidedFlag = snap.aidAttacked["E_AID"]
+    local plainFlag = snap.aidAttacked["E_PLAIN"]
+    local count = 0
+    for _ in pairs(snap.aidAttacked) do count = count + 1 end
+    local ok = aidedFlag == true and plainFlag == nil and count == 1 and #snap.enemies == 2
+    return ok, string.format("aided=%s plain=%s count=%d enemies=%d",
+        tostring(aidedFlag), tostring(plainFlag), count, #snap.enemies)
 end }
 
 -- ---------------------------------------------------------------------------
